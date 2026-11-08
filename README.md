@@ -29,7 +29,11 @@ for the time window you pick. It runs on Windows, macOS and Linux.
 
 ## Download and install
 
-Get the latest installers from the
+The easiest way is the [download page](https://montesgp.github.io/orbitbar/):
+it detects your system and offers the right installer from the latest
+release in one click.
+
+You can also get the installers from the
 [Releases page](https://github.com/montesgp/orbitbar/releases/latest) and pick
 the file for your OS:
 

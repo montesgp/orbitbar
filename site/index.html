@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.github.com; base-uri 'none'; form-action 'none'">
+<title>Orbitbar: token usage and cost of your AI coding agents, always in view</title>
+<meta name="description" content="Orbitbar is a small always-on-top bar that shows the token usage and cost of Claude Code, Codex and OpenCode, per project. Free and open source for Windows, macOS and Linux.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Orbitbar">
+<meta property="og:description" content="The token usage and cost of your AI coding agents, always in view. Free and open source for Windows, macOS and Linux.">
+<meta property="og:url" content="https://montesgp.github.io/orbitbar/">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="main.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="orbits" aria-hidden="true">
+      <span class="ring ring-1"></span>
+      <span class="ring ring-2"></span>
+      <span class="ring ring-3"></span>
+    </div>
+    <img class="logo" src="icon.svg" width="96" height="96" alt="">
+    <h1>Orbitbar</h1>
+    <p class="tagline">The token usage and cost of your AI coding agents, <span class="gold">always in view</span>.</p>
+
+    <!-- Without JavaScript this opens the latest release page; main.js turns it into a direct
+         download of the installer for the visitor's system. -->
+    <a id="download" class="download" href="https://github.com/montesgp/orbitbar/releases/latest">
+      <svg class="download-icon" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="download-text">
+        <span class="download-label">Download <span id="download-os">Orbitbar</span></span>
+        <span id="download-detail" class="download-detail">Windows, macOS and Linux</span>
+      </span>
+    </a>
+    <p id="formats" class="formats" hidden>Other formats: <span id="formats-links"></span></p>
+    <p id="others" class="others" hidden><span id="others-prefix">Also for</span>
+      <a id="link-windows" href="https://github.com/montesgp/orbitbar/releases/latest">Windows</a><span id="sep-windows"> · </span>
+      <a id="link-macos" href="https://github.com/montesgp/orbitbar/releases/latest">macOS</a><span id="sep-macos"> · </span>
+      <a id="link-linux" href="https://github.com/montesgp/orbitbar/releases/latest">Linux</a>
+    </p>
+    <p id="desktop-only" class="note" hidden>Orbitbar is a desktop app. Open this page on your Windows, Mac or Linux computer to download it.</p>
+    <p class="meta">Free and open source · Windows 10 and 11, macOS (Apple silicon and Intel), Linux x64</p>
+    <p id="release" class="meta" hidden><a id="release-link" href="https://github.com/montesgp/orbitbar/releases/latest">Latest release <span id="release-tag"></span></a><span id="release-date"></span></p>
+  </header>
+
+  <section class="demo" aria-labelledby="demo-title">
+    <h2 id="demo-title" class="visually-hidden">See it in action</h2>
+    <figure class="demo-figure">
+      <div id="demo-frame" class="demo-frame">
+        <div id="stage" class="stage static" aria-hidden="true">
+          <div class="wall"></div>
+
+          <div class="term">
+            <div class="term-bar"><i></i><i></i><i></i><span>my-app — claude</span></div>
+            <div id="term-body" class="term-body">
+              <p class="t-dim">$ claude</p>
+              <p><span class="t-gold">✻</span> Welcome back! Working in ~/projects/my-app</p>
+              <p class="t-prompt">&gt; add rate limiting to the login endpoint</p>
+              <p><span class="t-dot">●</span> Reading src/routes/auth.ts</p>
+              <p><span class="t-dot">●</span> Reading src/middleware/index.ts</p>
+              <p><span class="t-dot">●</span> Writing src/middleware/rate-limit.ts</p>
+            </div>
+          </div>
+
+          <div id="ob" class="ob">
+            <aside id="ob-panel" class="ob-panel">
+              <div class="ob-panel-head">
+                <span id="ob-select" class="ob-select"><span id="ob-window">7 days</span><span class="ob-chev">⌄</span></span>
+                <span class="ob-close">✕</span>
+              </div>
+              <div id="ob-options" class="ob-options">
+                <span data-window="today">Today</span>
+                <span data-window="week">7 days</span>
+                <span>30 days</span>
+                <span>This month</span>
+              </div>
+              <div id="ob-sections" class="ob-sections">
+                <div class="ob-section">
+                  <p class="ob-agent">Claude</p>
+                  <p>in 11.5K out 1.42M cache 1207.10M/20.37M</p>
+                  <p class="ob-dim">reasoning 222.7K · 5.7K entries</p>
+                  <p class="ob-cost">≈ $317.67 API</p>
+                  <p class="ob-row"><span>my-app</span><span>905.1K ≈ $218.52 API</span></p>
+                  <p class="ob-row"><span>api-service</span><span>413.9K ≈ $83.87 API</span></p>
+                  <p class="ob-row"><span>docs-site</span><span>101.4K ≈ $15.28 API</span></p>
+                </div>
+                <div class="ob-section">
+                  <p class="ob-agent">Codex</p>
+                  <p>in 57.88M out 192.4K cache 56.33M/0</p>
+                  <p class="ob-dim">reasoning 65.7K · 8 entries</p>
+                  <p class="ob-cost">≈ $16.67 API</p>
+                  <p class="ob-row"><span>web-store</span><span>192.4K ≈ $16.67 API</span></p>
+                </div>
+                <div class="ob-section">
+                  <p class="ob-agent">OpenCode</p>
+                  <p>in 9.60M out 1.55M cache 209.04M/0</p>
+                  <p class="ob-dim">reasoning 498.4K · 25 entries</p>
+                  <p class="ob-cost">$0.00</p>
+                  <p class="ob-row"><span>api-service</span><span>1.38M $0.00</span></p>
+                  <p class="ob-row"><span>cli-tool</span><span>173.6K $0.00</span></p>
+                </div>
+              </div>
+            </aside>
+
+            <div id="ob-menu" class="ob-menu">
+              <span>Edit config</span>
+              <span>Open pricing file</span>
+              <span data-item="collapse">Collapse</span>
+              <span>Reload config</span>
+              <hr>
+              <span data-item="light"><b class="ob-check" data-check="light"></b>Light</span>
+              <span data-item="dark"><b class="ob-check" data-check="dark">✓</b>Dark</span>
+              <hr>
+              <span><b class="ob-check">✓</b>Start with system</span>
+              <span><b class="ob-check"></b>Show example action</span>
+              <hr>
+              <span>Quit Orbitbar</span>
+            </div>
+
+            <div id="ob-bar" class="ob-bar">
+              <div class="ob-col">
+                <span id="ob-collapse" class="ob-collapse">›</span>
+                <span class="ob-cell" data-cell="claude">✳</span>
+                <span class="ob-cell" data-cell="codex">◎</span>
+                <span class="ob-cell" data-cell="opencode">◈</span>
+                <span class="ob-cell" data-cell="usage">$</span>
+                <span class="ob-cell" data-cell="settings">⚙</span>
+              </div>
+              <span id="ob-tab" class="ob-tab">‹</span>
+            </div>
+          </div>
+
+          <svg id="cursor" class="cursor" viewBox="0 0 20 24" width="20" height="24"><path d="M2 2v17l4.6-4.3 3 6.8 3-1.3-3-6.6H16z" fill="#ffffff" stroke="#111111" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+      <figcaption class="demo-note">
+        <button id="demo-toggle" class="demo-toggle" type="button" hidden>Pause</button>
+        <span>A preview of the bar: open an agent's usage, switch to 7 days, change the theme and collapse it to a tab. The numbers are an example.</span>
+      </figcaption>
+    </figure>
+  </section>
+
+  <section class="agents" aria-label="Supported agents">
+    <p>Reads the session history that <strong>Claude Code</strong>, <strong>Codex</strong> and <strong>OpenCode</strong> already keep on your computer. Have only one of them? That works too.</p>
+  </section>
+
+  <section class="features" aria-label="Features">
+    <article>
+      <span class="feature-glyph" aria-hidden="true">◐</span>
+      <h2>Always there, never in the way</h2>
+      <p>A slim bar at the edge of your screen, above your other windows. Drag it anywhere on any monitor, or fold it into a small tab.</p>
+    </article>
+    <article>
+      <span class="feature-glyph" aria-hidden="true">$</span>
+      <h2>Tokens and cost per project</h2>
+      <p>One click shows each agent's tokens and cost for today, the last 7 or 30 days, or this month, split by the project you worked on.</p>
+    </article>
+    <article>
+      <span class="feature-glyph" aria-hidden="true">◎</span>
+      <h2>Private by design</h2>
+      <p>Everything stays on your computer. No account, no telemetry and no network calls: Orbitbar only reads files your agents already wrote.</p>
+    </article>
+    <article>
+      <span class="feature-glyph" aria-hidden="true">✳</span>
+      <h2>Honest prices</h2>
+      <p>Claude Code and Codex usage is priced at each provider's public API rates and marked as an estimate; OpenCode's own cost is shown as is. Add your own prices in one small file.</p>
+    </article>
+    <article>
+      <span class="feature-glyph" aria-hidden="true">◈</span>
+      <h2>Your own shortcuts</h2>
+      <p>Add cells that open a page, start a program, or show a command's output right in the panel.</p>
+    </article>
+    <article>
+      <span class="feature-glyph" aria-hidden="true">⚙</span>
+      <h2>Light or dark, your way</h2>
+      <p>Switch themes from the bar's menu, start it with your computer, and keep every setting in one file.</p>
+    </article>
+  </section>
+
+  <section class="help" aria-labelledby="help-title">
+    <h2 id="help-title">Opening it the first time</h2>
+    <p>Your system may warn you the first time, because the app is not code-signed yet. Here is what to do.</p>
+
+    <details id="help-windows" open>
+      <summary>Windows</summary>
+      <ol>
+        <li>Double-click the downloaded <code>Orbitbar_…_x64-setup.exe</code>.</li>
+        <li>If you see “Windows protected your PC”, click <strong>More info</strong>, then <strong>Run anyway</strong>.</li>
+        <li>Follow the installer, then open Orbitbar from the Start menu. It appears at the right edge of your screen.</li>
+      </ol>
+      <p class="tip">Prefer an MSI package? Pick the <code>.msi</code> under “Other formats”.</p>
+    </details>
+
+    <details id="help-macos">
+      <summary>macOS</summary>
+      <ol>
+        <li>Open the downloaded <code>.dmg</code> and drag <strong>Orbitbar</strong> to <strong>Applications</strong>.</li>
+        <li>The first time, right-click (or Control-click) Orbitbar in Applications and choose <strong>Open</strong>, then confirm.</li>
+        <li>If it still will not open, go to <strong>System Settings → Privacy &amp; Security</strong> and click <strong>Open Anyway</strong>.</li>
+      </ol>
+      <p class="tip">One download works on every Mac: Apple silicon (M1 or newer) and Intel.</p>
+    </details>
+
+    <details id="help-linux">
+      <summary>Linux</summary>
+      <ol>
+        <li>Make the downloaded AppImage executable: right-click it → <strong>Properties</strong> → <strong>Allow executing file as program</strong>, or run <code>chmod +x Orbitbar_*.AppImage</code>.</li>
+        <li>Double-click it, or run <code>./Orbitbar_*.AppImage</code>.</li>
+        <li>The AppImage needs WebKitGTK 4.1 on your system. The <code>.deb</code> (Debian, Ubuntu) and <code>.rpm</code> (Fedora, openSUSE) packages install it for you.</li>
+      </ol>
+    </details>
+
+    <p>Orbitbar does not update itself yet: to update, close the bar and install the newest version from this page. Your settings are kept.</p>
+  </section>
+</main>
+
+<footer>
+  <nav aria-label="Project links">
+    <a href="https://github.com/montesgp/orbitbar">GitHub</a>
+    <a href="https://github.com/montesgp/orbitbar/releases">All releases</a>
+    <a href="https://github.com/montesgp/orbitbar#configuration">Configuration</a>
+    <a href="https://github.com/montesgp/orbitbar#data-sources">Data sources</a>
+    <a href="https://github.com/montesgp/orbitbar/blob/main/LICENSE">License: MIT</a>
+  </nav>
+  <p>Orbitbar only reads your agents' local files. It never sends your data anywhere.</p>
+</footer>
+</body>
+</html>
