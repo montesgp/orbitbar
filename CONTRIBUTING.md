@@ -132,3 +132,7 @@ The **Pages** workflow (`.github/workflows/pages.yml`) publishes it to GitHub
 Pages when a change to `site/` reaches `main`. To preview it, serve the folder
 locally, for example with `python -m http.server --directory site`, and open
 the printed address.
+
+`site/og-image.png` (1200×630) is the preview that chats and social networks
+show when the link is shared, referenced by the `og:image` tags in
+`index.html`. Regenerate it when the icon or the tagline changes.
