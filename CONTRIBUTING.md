@@ -86,3 +86,16 @@ username before pasting.
    `tauri-apps/tauri-action` and publishes them as the GitHub Release
    "Orbitbar vX.Y.Z". The installers are unsigned. Check the release page
    afterwards for the expected assets.
+5. The [download page](https://montesgp.github.io/orbitbar/) follows the new
+   release by itself: it reads the latest release from the GitHub API and
+   picks each installer by its name pattern (`_x64-setup.exe`,
+   `_universal.dmg`, `_amd64.AppImage`, ...). If the installer names change,
+   update the patterns in `site/main.js`.
+
+## Download page
+
+The page in `site/` is plain HTML, CSS and JavaScript with no build step.
+The **Pages** workflow (`.github/workflows/pages.yml`) publishes it to GitHub
+Pages when a change to `site/` reaches `main`. To preview it, serve the folder
+locally, for example with `python -m http.server --directory site`, and open
+the printed address.

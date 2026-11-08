@@ -22,9 +22,11 @@ Ask the person which one applies if it is not clear:
 
 Do not clone or build anything.
 
-1. Download the installer for their OS from
-   <https://github.com/montesgp/orbitbar/releases/latest>. The file names per
-   OS are in [README.md § Download and install](README.md#download-and-install).
+1. Send them to the download page, <https://montesgp.github.io/orbitbar/>,
+   which offers the installer for their OS from the latest release. The file
+   names per OS, if they download from
+   <https://github.com/montesgp/orbitbar/releases/latest> instead, are in
+   [README.md § Download and install](README.md#download-and-install).
 2. The installers are unsigned. Walk them through the first-run prompt for
    their OS: [README.md § First run](README.md#first-run-unsigned-installers).
 3. Agents are optional. Orbitbar reports any of Claude Code, Codex or
