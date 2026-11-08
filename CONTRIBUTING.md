@@ -1,5 +1,14 @@
 # Contributing
 
+## How the project is run
+
+- The owner, [@montesgp](https://github.com/montesgp), reviews and merges every
+  contribution. Nobody else has write access.
+- Everyone else contributes through **issues** and **pull requests from a
+  fork**, following this guide.
+- Workflows from forks run after the owner approves them, so your first CI run
+  may wait for a moment.
+
 ## Development setup
 
 Install the build prerequisites for your OS (see
@@ -34,13 +43,37 @@ DOM code so it can be unit tested once one is added.
 
 ## Branches
 
-- Create a feature branch (`feat/...`, `fix/...`, `chore/...`) and open a pull
-  request against `dev`.
-- Releases go from `dev` to `main` through a pull request.
+```
+feature branch ──► dev ──► main (GitHub Pages, tagged vX.Y.Z)
+hotfix/... ──────────────► main ──► back into dev
+```
 
-```
-feature branch ──► dev ──► main (tagged vX.Y.Z)
-```
+- `dev` collects the work in progress. Create a feature branch from `dev`
+  (`feat/...`, `fix/...`, `chore/...`) and open a pull request against `dev`.
+- `main` holds the final, promoted version: GitHub Pages and releases come only
+  from `main`. When the work on `dev` is complete and tested, the owner promotes
+  it with a pull request from `dev` to `main`, then fast-forwards `dev` to
+  `main` (`git push origin main:dev` once `ci-gate` is green on `main`) so both
+  branches point at the same commit.
+- `main` and `dev` are protected: they cannot be force-pushed or deleted, and
+  every change lands through a pull request with a green `ci-gate` check. Only
+  the owner merges, by hand or through the owner's coding agents. The single
+  exception is the owner's fast-forward of `dev` to `main` right after a
+  promotion, which adds no new commits.
+
+### Hotfixes
+
+Orbitbar is a desktop app that people update by hand, so most fixes simply go
+through `dev` like any other change. Use a hotfix only when a released version
+is broken and `dev` holds work that is not ready to ship:
+
+1. Create `hotfix/<short-name>` from `main`.
+2. Fix the problem (with a test where the logic allows it) and bump the patch
+   version (`X.Y.Z+1`) in the four places listed in
+   [Release process](#release-process).
+3. Open a pull request against `main`. The owner merges it once `ci-gate` is
+   green and tags the patch release.
+4. Bring the fix back into `dev` with a pull request from `main` to `dev`.
 
 ## Commit messages
 

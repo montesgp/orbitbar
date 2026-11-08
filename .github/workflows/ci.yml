@@ -68,3 +68,13 @@ jobs:
       - name: Clippy
         working-directory: app/src-tauri
         run: cargo clippy --all-targets -- -D warnings
+
+  # Single required check for branch protection: green only when every platform passed.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all checks to pass
+        run: test "${{ needs.check.result }}" = "success"
