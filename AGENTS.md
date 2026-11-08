@@ -108,13 +108,13 @@ DOM code so it stays unit-testable.
 - **Version bumps touch four files**, kept equal; see
   [CONTRIBUTING.md § Release process](CONTRIBUTING.md#release-process).
   Releases run only when a `vX.Y.Z` tag is pushed.
-- **Pull requests target `dev`**, never `main`. `dev` reaches `main` through
-  a promotion pull request, and `main` is the only source of GitHub Pages and
-  releases. The only exception is a `hotfix/...` branch from `main` for a
-  broken release; see
-  [CONTRIBUTING.md § Hotfixes](CONTRIBUTING.md#hotfixes). Both branches are
-  protected and require a green `ci-gate`; the owner's agents merge their own
-  pull requests once `ci-gate` is SUCCESS on the exact head commit.
+- **Pull requests target `dev`.** `dev` reaches `main` only through a
+  promotion pull request, and `main` is the only source of GitHub Pages and
+  releases. The one exception is a `hotfix/...` branch from `main` for a
+  broken release; see [CONTRIBUTING.md § Hotfixes](CONTRIBUTING.md#hotfixes).
+  Both branches are protected and require a green `ci-gate`. The owner merges;
+  the owner's coding agents act for the owner and merge their own pull
+  requests once `ci-gate` is SUCCESS on the exact head commit.
 - **`app/src-tauri/target/` is only a build cache.** It can grow to several
   GB; `cargo clean` in `app/src-tauri/` reclaims it and the next build
   recreates it. It holds the person's binary if they run Orbitbar from

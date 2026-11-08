@@ -55,9 +55,11 @@ hotfix/... ──────────────► main ──► back int
   it with a pull request from `dev` to `main`, then fast-forwards `dev` to
   `main` (`git push origin main:dev` once `ci-gate` is green on `main`) so both
   branches point at the same commit.
-- `main` and `dev` are protected: changes land only through pull requests with
-  a green `ci-gate` check, and the branches cannot be force-pushed or deleted.
-  Only the owner merges.
+- `main` and `dev` are protected: they cannot be force-pushed or deleted, and
+  every change lands through a pull request with a green `ci-gate` check. Only
+  the owner merges, by hand or through the owner's coding agents. The single
+  exception is the owner's fast-forward of `dev` to `main` right after a
+  promotion, which adds no new commits.
 
 ### Hotfixes
 
