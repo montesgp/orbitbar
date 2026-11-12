@@ -32,10 +32,10 @@ Release builds gain Linux ARM64 and Windows ARM64; the download page offers them
 | ID | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- |
 | T1 | S1, S2, S5 | inline | done | `76115a0` (workflow), docs in T2 commit |
-| T2 | S3, S4, S5 | inline | done | (this commit) |
-| T3 | S6 | inline (CI on a throwaway branch) | done (branch delete pending) | run 43285440827 |
-| T4 | S1-S6 | gentle-ai-verify (Risk item 5: release workflow) | pending | |
-| T5 | S7 | inline: PR to `dev`, `ci-gate`, merge | pending | |
+| T2 | S3, S4, S5 | inline | done | `ae06cab` (site + docs) |
+| T3 | S6 | inline (CI on a throwaway branch) | done | run 43285440827; branch deleted |
+| T4 | S1-S6 | inline (verifier unavailable) + native review | done | review `review-764cc75f691d7bde` approved |
+| T5 | S7 | inline: PR to `dev`, `ci-gate`, merge | in progress | |
 
 - T1: release matrix entries for Linux ARM64 and Windows ARM64; README file table; CONTRIBUTING release step.
 - T2: `site/main.js` arch detection and ARM64 links; `site/index.html` links row and help text.
@@ -65,3 +65,11 @@ Delivery: single PR, forecast ~200 authored changed lines (under the ~400 budget
 - L6 (agent, T2): no frontend test runner; scratch harness (Node vm, fake DOM/navigator/fetch, outside the repo) ran
   base `9dc7a42` vs new `site/main.js` over 14 browsers x {release without ARM64, with ARM64, offline}. RED on base:
   29 failures. GREEN on new: all checks; differential: without ARM64 assets or offline every element is identical.
+- L7 (agent, T4): `gentle-ai-verify` launch refused by the runtime (no admitted Risk line); not retried, reported
+  as unavailable. Inline checks instead: YAML diff of release.yml vs base (other jobs identical, `publish-release`
+  still needs every build, the three existing entries keep runner/args/Rust targets, fail-fast false); no asset name
+  collision; each site pattern matches exactly one file. Browser check (Playwright, stubbed Edge on Windows on Arm):
+  button "Download for Windows / Windows 11 on Arm · installer", line "x64: installer (.exe) · .msi". Assess: high
+  (escalated item 5). Native review lineage `review-764cc75f691d7bde` (lenses risk, resilience, reliability):
+  approved, acknowledged; advisories R3-001 (WARNING, site/main.js:98-111), R3-002 (site/main.js:203), R3-003
+  (release.yml:72-77), all non-blocking follow-ups.
