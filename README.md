@@ -40,8 +40,14 @@ the file for your OS:
 | OS | File to pick |
 | --- | --- |
 | Windows | `Orbitbar_<version>_x64-setup.exe` (recommended) or `Orbitbar_<version>_x64_en-US.msi` |
+| Windows on Arm | `Orbitbar_<version>_arm64-setup.exe` or `Orbitbar_<version>_arm64_en-US.msi` (the x64 installers also run, through emulation) |
 | macOS | `Orbitbar_<version>_universal.dmg` (Apple silicon and Intel) |
 | Linux | `Orbitbar_<version>_amd64.AppImage` (run it directly), `.deb` (Debian, Ubuntu) or `.rpm` (Fedora, openSUSE) |
+| Linux on ARM64 | `Orbitbar_<version>_aarch64.AppImage`, `Orbitbar_<version>_arm64.deb` or `Orbitbar-<version>-1.aarch64.rpm` |
+
+The download page picks the ARM64 build when the browser reports an Arm
+processor (Chrome and Edge do; Firefox does on Linux). Otherwise it offers the
+x64 build and links the ARM64 files below the button.
 
 Agents are optional: Orbitbar reads whichever of Claude Code, Codex and
 OpenCode are installed and reports the others as not installed. SQLite is

@@ -47,13 +47,14 @@
       </span>
     </a>
     <p id="formats" class="formats" hidden>Other formats: <span id="formats-links"></span></p>
+    <p id="arch" class="formats" hidden><span id="arch-name">ARM64</span>: <span id="arch-links"></span></p>
     <p id="others" class="others" hidden><span id="others-prefix">Also for</span>
       <a id="link-windows" href="https://github.com/montesgp/orbitbar/releases/latest">Windows</a><span id="sep-windows"> · </span>
       <a id="link-macos" href="https://github.com/montesgp/orbitbar/releases/latest">macOS</a><span id="sep-macos"> · </span>
       <a id="link-linux" href="https://github.com/montesgp/orbitbar/releases/latest">Linux</a>
     </p>
     <p id="desktop-only" class="note" hidden>Orbitbar is a desktop app. Open this page on your Windows, Mac or Linux computer to download it.</p>
-    <p class="meta">Free and open source · Windows 10 and 11, macOS (Apple silicon and Intel), Linux x64</p>
+    <p class="meta">Free and open source · Windows 10 and 11 (x64 and Arm), macOS (Apple silicon and Intel), Linux (x64 and ARM64)</p>
     <p id="release" class="meta" hidden><a id="release-link" href="https://github.com/montesgp/orbitbar/releases/latest">Latest release <span id="release-tag"></span></a><span id="release-date"></span></p>
   </header>
 
@@ -198,11 +199,11 @@
     <details id="help-windows" open>
       <summary>Windows</summary>
       <ol>
-        <li>Double-click the downloaded <code>Orbitbar_…_x64-setup.exe</code>.</li>
+        <li>Double-click the downloaded <code>Orbitbar_…_x64-setup.exe</code> (<code>_arm64-setup.exe</code> on Windows on Arm).</li>
         <li>If you see “Windows protected your PC”, click <strong>More info</strong>, then <strong>Run anyway</strong>.</li>
         <li>Follow the installer, then open Orbitbar from the Start menu. It appears at the right edge of your screen.</li>
       </ol>
-      <p class="tip">Prefer an MSI package? Pick the <code>.msi</code> under “Other formats”.</p>
+      <p class="tip">Prefer an MSI package? Pick the <code>.msi</code> under “Other formats”. On an Arm PC the x64 build also runs, through emulation.</p>
     </details>
 
     <details id="help-macos">
@@ -222,6 +223,7 @@
         <li>Double-click it, or run <code>./Orbitbar_*.AppImage</code>.</li>
         <li>The AppImage needs WebKitGTK 4.1 on your system. The <code>.deb</code> (Debian, Ubuntu) and <code>.rpm</code> (Fedora, openSUSE) packages install it for you.</li>
       </ol>
+      <p class="tip">On a 64-bit Arm computer (Raspberry Pi 4 or newer with a 64-bit system), pick the ARM64 files: <code>_aarch64.AppImage</code>, <code>_arm64.deb</code> or <code>.aarch64.rpm</code>.</p>
     </details>
 
     <p>Orbitbar does not update itself yet: to update, close the bar and install the newest version from this page. Your settings are kept.</p>
