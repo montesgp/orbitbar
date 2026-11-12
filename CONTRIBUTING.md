@@ -115,14 +115,16 @@ username before pasting.
    ```
 
 4. The **Release** workflow (`.github/workflows/release.yml`) builds the
-   installers for Windows, macOS (universal) and Linux with
+   installers for Windows (x64, and ARM64 cross-compiled), macOS (universal)
+   and Linux (x64, and ARM64 on the `ubuntu-22.04-arm` runner) with
    `tauri-apps/tauri-action` and publishes them as the GitHub Release
    "Orbitbar vX.Y.Z". The installers are unsigned. Check the release page
    afterwards for the expected assets.
 5. The [download page](https://montesgp.github.io/orbitbar/) follows the new
    release by itself: it reads the latest release from the GitHub API and
    picks each installer by its name pattern (`_x64-setup.exe`,
-   `_universal.dmg`, `_amd64.AppImage`, ...). If the installer names change,
+   `_arm64-setup.exe`, `_universal.dmg`, `_amd64.AppImage`,
+   `_aarch64.AppImage`, ...). If the installer names change,
    update the patterns in `site/main.js`.
 
 ## Download page

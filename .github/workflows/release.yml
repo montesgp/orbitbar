@@ -68,12 +68,28 @@ jobs:
           - name: Windows
             platform: windows-latest
             args: ''
+            rust-targets: ''
+          # Cross-compiled on the x64 runner, as the Tauri docs describe. The
+          # NSIS installer itself stays x86 and runs under emulation on ARM.
+          - name: Windows ARM64
+            platform: windows-latest
+            args: '--target aarch64-pc-windows-msvc'
+            rust-targets: 'aarch64-pc-windows-msvc'
           - name: macOS (universal)
             platform: macos-latest
             args: '--target universal-apple-darwin'
+            # Both Apple targets are needed for the universal binary.
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
           - name: Linux
             platform: ubuntu-22.04
             args: ''
+            rust-targets: ''
+          # Native ARM runner (free for public repositories): the AppImage
+          # tooling cannot cross-compile.
+          - name: Linux ARM64
+            platform: ubuntu-22.04-arm
+            args: ''
+            rust-targets: ''
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -88,13 +104,14 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Both Apple targets are needed for the universal binary.
-          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust-targets }}
 
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri -> target
+          # The two Windows builds share a runner and a host toolchain.
+          key: ${{ matrix.name }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
