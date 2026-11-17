@@ -9,7 +9,7 @@
  * tokens, expandable to every project.
  */
 
-export type TimeWindow = "today" | "last7Days" | "last30Days" | "thisMonth";
+export type TimeWindow = "today" | "last7Days" | "last30Days" | "thisMonth" | "last365Days";
 
 export interface WindowOption {
   value: TimeWindow;
@@ -22,6 +22,7 @@ export const WINDOW_OPTIONS: WindowOption[] = [
   { value: "last7Days", label: "7 days" },
   { value: "last30Days", label: "30 days" },
   { value: "thisMonth", label: "This month" },
+  { value: "last365Days", label: "365 days" },
 ];
 
 export type AgentStatus =

@@ -65,8 +65,9 @@ through Tauri's `invoke()` IPC.
 | Placement | `app/src-tauri/src/placement.rs` | Pure window-placement rules: grow toward the side with room, clamp into the work area, collapse anchoring, restoring a saved position |
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
-| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
+| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the other two |
+| Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket on its own |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
 ## Interaction model
@@ -107,7 +108,8 @@ through Tauri's `invoke()` IPC.
 ## Data flow: opening the usage panel
 
 1. The frontend calls `invoke("get_usage", { window })` for the selected
-   `TimeWindow` (`today` / `last7Days` / `last30Days` / `thisMonth`),
+   `TimeWindow` (`today` / `last7Days` / `last30Days` / `thisMonth` /
+   `last365Days`, today plus the previous 364 days),
    starting with `today`.
 2. `get_usage` (in `lib.rs`) resolves the three store paths under the
    user's home directory, loads `pricing.json` if present, and runs the
@@ -121,6 +123,12 @@ through Tauri's `invoke()` IPC.
 4. Claude and Codex totals are priced through `pricing::estimate_cost`
    against the built-in table plus any `pricing.json` overrides; OpenCode
    already carries its own reported cost and skips pricing entirely.
+   Claude entries carry their own timestamps, so `claude::read_daily`
+   sorts them into `(local date, project key)` buckets of raw counters plus
+   the bucket's last model (`usage::daily`), and `claude::report` folds the
+   window's dates: each bucket is priced with its own model and the amounts
+   summed, so a total's cost is missing only when no bucket in it has a
+   price.
 5. The `UsageSnapshot` — window bounds, per-agent totals, per-project
    breakdown, an optional `pricingWarning` — serializes back to the
    frontend, where `usage-view.ts` turns it into the rendered panel.
@@ -196,6 +204,7 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src-tauri/src/placement.rs` | Pure placement rules (unit tested) |
 | `app/src-tauri/src/config.rs` | Config schema, load/save, theme palettes |
 | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, `UsageSnapshot`, project-path normalization |
+| `app/src-tauri/src/usage/daily.rs` | Daily buckets and the window fold |
 | `app/src-tauri/src/usage/claude.rs` | Claude Code JSONL reader |
 | `app/src-tauri/src/usage/codex.rs` | Codex CLI JSONL reader |
 | `app/src-tauri/src/usage/opencode.rs` | OpenCode SQLite reader |

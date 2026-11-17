@@ -10,6 +10,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod daily;
 pub mod opencode;
 pub mod pricing;
 
@@ -29,11 +30,13 @@ pub enum TimeWindow {
     Last7Days,
     Last30Days,
     ThisMonth,
+    Last365Days,
 }
 
 /// Resolves a window to a local `[start, end)` instant pair. All windows are
 /// full-day boundaries at local midnight, so "last 7 days" always means 7
-/// whole days including today, never a rolling 168-hour clock.
+/// whole days including today, never a rolling 168-hour clock, and "365 days"
+/// is today plus the previous 364 days.
 pub fn window_range(window: TimeWindow, now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
     let today_start = now
         .date_naive()
@@ -69,6 +72,35 @@ pub fn window_range(window: TimeWindow, now: DateTime<Local>) -> (DateTime<Local
                 .unwrap_or(month_start);
             (month_start, next_month_start)
         }
+        TimeWindow::Last365Days => {
+            // Counted in calendar days, not 364 x 24 hours, so a daylight-
+            // saving change inside the year never moves the start off midnight.
+            let start_naive = today_start.date_naive() - Duration::days(364);
+            let start = Local
+                .from_local_datetime(&start_naive.and_hms_opt(0, 0, 0).unwrap())
+                .earliest()
+                .unwrap_or(today_start - Duration::days(364));
+            (start, tomorrow_start)
+        }
+    }
+}
+
+/// Strips the `\\?\` verbatim prefix `std::fs::canonicalize` adds on Windows
+/// (`\\?\UNC\server\share` becomes `\\server\share`), leaving any other path as is.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
+}
+
+/// `path` as the file system resolves it (junctions, symlinks, 8.3 short
+/// names, letter case), or `path` itself when it cannot be resolved.
+fn resolved_dir(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => PathBuf::from(strip_verbatim_prefix(&resolved.to_string_lossy())),
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -272,12 +304,9 @@ impl RootPolicy {
     /// an agent recorded the long one; macOS reports `/var` for `/private/var`).
     pub fn system() -> Self {
         let mut temp_dirs = vec![std::env::temp_dir()];
-        if let Ok(resolved) = std::fs::canonicalize(&temp_dirs[0]) {
-            let text = resolved.to_string_lossy();
-            let resolved = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
-            if resolved != temp_dirs[0] {
-                temp_dirs.push(resolved);
-            }
+        let resolved = resolved_dir(&temp_dirs[0]);
+        if resolved != temp_dirs[0] {
+            temp_dirs.push(resolved);
         }
         Self { temp_dirs, home: dirs::home_dir() }
     }
@@ -314,6 +343,9 @@ impl Default for ProjectRootCache {
 /// 2. Otherwise the root is the nearest ancestor directory (including `cwd`
 ///    itself, or its nearest surviving ancestor when `cwd` was deleted) that
 ///    contains a `.git` entry; the walk never climbs into the home directory.
+///    The walk runs on the path as the file system resolves it (junctions,
+///    symlinks, 8.3 short names), so `C:\repositories\x` reached through a
+///    junction to `R:\repositories\x` gives the same key as the target.
 /// 3. With no repository found: an existing `cwd` (the home directory, a plain
 ///    folder) is excluded; a missing `cwd` belongs to a repository that was
 ///    renamed or deleted, and is keyed by the topmost missing directory, the
@@ -384,22 +416,37 @@ fn resolve_project_root_uncached(cwd: &str, policy: &RootPolicy) -> Option<Strin
         }
     }
 
+    // From here the walk runs on resolved paths: the surviving directory
+    // through junctions and symlinks, and the temp and home boundaries in
+    // their resolved form too, so a link never slips past either.
+    let start = PathBuf::from(normalize_project_path(&resolved_dir(start).to_string_lossy()));
+    if top_missing.is_none() {
+        let resolved_cwd = start.to_string_lossy();
+        if policy.temp_dirs.iter().any(|temp| is_within(&resolved_cwd, &resolved_dir(temp))) {
+            return None;
+        }
+    }
+
     // Never walk past the user's home directory. Dotfiles managed as a bare
     // git repo directly in $HOME are common, and without this boundary every
     // session cwd that has no repo of its own would silently merge into one
     // giant project named after the home folder instead of falling back to
     // its own path.
-    let home_boundary = policy.home.clone();
+    let home_boundary: Vec<PathBuf> = policy
+        .home
+        .iter()
+        .flat_map(|home| [home.clone(), resolved_dir(home)])
+        .collect();
 
-    let mut current = start;
+    let mut current = start.as_path();
     loop {
-        if home_boundary.as_deref() == Some(current) {
+        if home_boundary.iter().any(|home| home == current) {
             break;
         }
         let git_path = current.join(".git");
         if git_path.is_file() {
             if let Some(main_root) = main_root_from_gitdir_file(&git_path) {
-                return Some(normalize_project_path(&main_root.to_string_lossy()));
+                return Some(normalize_project_path(&resolved_dir(&main_root).to_string_lossy()));
             }
             // Unreadable or malformed gitdir pointer: this directory is
             // still the most honest root we have, rather than failing the
@@ -556,6 +603,31 @@ mod tests {
     }
 
     #[test]
+    fn last_365_days_includes_today_and_the_previous_364_days() {
+        let now = local(2026, 9, 28, 8, 0);
+        let (start, end) = window_range(TimeWindow::Last365Days, now);
+        assert_eq!(start, local(2025, 9, 29, 0, 0));
+        assert_eq!(end, local(2026, 9, 29, 0, 0));
+        assert_eq!((end.date_naive() - start.date_naive()).num_days(), 365);
+    }
+
+    #[test]
+    fn last_365_days_serializes_as_last365days() {
+        assert_eq!(serde_json::to_string(&TimeWindow::Last365Days).unwrap(), "\"last365Days\"");
+        let parsed: TimeWindow = serde_json::from_str("\"last365Days\"").unwrap();
+        assert_eq!(parsed, TimeWindow::Last365Days);
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_only_the_verbatim_prefix() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\R:\repositories\orbitbar"), r"R:\repositories\orbitbar");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\server\share\repo"), r"\\server\share\repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\repositories\orbitbar"), r"C:\repositories\orbitbar");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+        assert_eq!(strip_verbatim_prefix("/home/me/orbitbar"), "/home/me/orbitbar");
+    }
+
+    #[test]
     fn default_window_is_today() {
         assert_eq!(TimeWindow::default(), TimeWindow::Today);
     }
@@ -626,7 +698,7 @@ mod tests {
 
         let mut cache = ProjectRootCache::with_policy(RootPolicy::default());
         let root = resolve_project_root(&nested.to_string_lossy(), &mut cache);
-        assert_eq!(root, Some(normalize_project_path(&dir.path().to_string_lossy())));
+        assert_eq!(root, canonical_key(dir.path()));
     }
 
     #[test]
@@ -646,7 +718,7 @@ mod tests {
 
         let mut cache = ProjectRootCache::with_policy(RootPolicy::default());
         let root = resolve_project_root(&worktree.to_string_lossy(), &mut cache);
-        assert_eq!(root, Some(normalize_project_path(&main.to_string_lossy())));
+        assert_eq!(root, canonical_key(&main));
     }
 
     /// A resolver whose walk stops at `home` and that treats `temp` as scratch,
@@ -664,6 +736,74 @@ mod tests {
 
     fn key(path: &Path) -> Option<String> {
         Some(normalize_project_path(&path.to_string_lossy()))
+    }
+
+    /// The key of an existing folder: its path as the file system resolves it
+    /// (macOS reports the temp dir as `/var` for `/private/var`; Windows may
+    /// report an 8.3 short name).
+    fn canonical_key(path: &Path) -> Option<String> {
+        let resolved = std::fs::canonicalize(path).unwrap();
+        Some(normalize_project_path(&strip_verbatim_prefix(&resolved.to_string_lossy())))
+    }
+
+    /// Links `link` to the existing directory `target`: a junction on Windows,
+    /// a symlink elsewhere. `false` when the OS refused to create it.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+                && link.exists()
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// `C:\repositories` is a junction to `R:\repositories`: a repository
+    /// reached through both paths is one project key, the resolved one.
+    #[test]
+    fn two_paths_to_the_same_repository_through_a_junction_share_one_key() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        let repo = real.join("orbitbar");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let link = dir.path().join("link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+        let p = || policy(dir.path(), &[]);
+
+        let direct = resolve(&repo.join("app"), p());
+        let through_link = resolve(&link.join("orbitbar").join("app"), p());
+        let link_root = resolve(&link.join("orbitbar"), p());
+        assert_eq!(direct, canonical_key(&repo));
+        assert_eq!(through_link, direct);
+        assert_eq!(link_root, direct);
+    }
+
+    /// A folder outside any repository stays excluded when it is reached
+    /// through a link: the home boundary is compared in resolved form too.
+    #[test]
+    fn a_linked_folder_outside_any_repository_is_still_excluded() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let real = dir.path().join("plain");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("plain-link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+
+        assert_eq!(resolve(&link, policy(dir.path(), &[])), None);
     }
 
     /// An existing folder with no repository above it (up to the home
@@ -703,7 +843,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let deleted = dir.path().join(".claude").join("worktrees").join("agent-gone");
 
-        assert_eq!(resolve(&deleted, RootPolicy::default()), key(dir.path()));
+        assert_eq!(resolve(&deleted, RootPolicy::default()), canonical_key(dir.path()));
     }
 
     /// A deleted folder with no repo above it is keyed by its own path.
