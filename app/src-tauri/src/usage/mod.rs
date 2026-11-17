@@ -991,21 +991,26 @@ mod tests {
         }
     }
 
-    /// A ledger that cannot be written never fails the collect.
+    /// A ledger that cannot be written never fails the collect. A directory
+    /// sits where the temp file goes, which blocks the write the same way on
+    /// every OS while the (missing) ledger itself still loads.
     #[test]
     fn a_ledger_that_cannot_be_saved_is_reported_in_the_detail() {
         let home = LedgerHome::new();
-        let not_a_dir = home.dir.path().join("config-file");
-        std::fs::write(&not_a_dir, "x").unwrap();
+        let ledger = home.ledger();
+        let config = ledger.parent().unwrap();
+        let blocker = config.join(format!("{}.{}.tmp", ledger::FILE_NAME, std::process::id()));
+        std::fs::create_dir_all(&blocker).unwrap();
         home.claude("s.jsonl", &[("r1", 14, 10)]);
         home.pi("s.jsonl", &[("c1", 14, "openai-codex", 7)]);
 
-        let snapshot = home.collect(Some(&not_a_dir.join(ledger::FILE_NAME)));
+        let snapshot = home.collect(Some(&ledger));
         let (claude, pi) = (&snapshot.agents[0], &snapshot.agents[3]);
         assert_eq!(claude.totals.output_tokens, 10);
         assert!(claude.detail.contains("history ledger not saved"), "{}", claude.detail);
         assert!(pi.detail.contains("history ledger not saved"), "{}", pi.detail);
-        assert_eq!(std::fs::read_to_string(&not_a_dir).unwrap(), "x");
+        assert!(!ledger.exists(), "no ledger written");
+        assert!(blocker.is_dir(), "the blocking directory is left alone");
     }
 
     /// Records older than the 365 days that end today leave the file.
@@ -1114,13 +1119,19 @@ mod tests {
         resolve_project_root(&cwd.to_string_lossy(), &mut ProjectRootCache::with_policy(policy))
     }
 
-    fn key(path: &Path) -> Option<String> {
-        Some(normalize_project_path(&path.to_string_lossy()))
-    }
-
     /// The key of an existing folder: its path as the file system resolves it
     /// (macOS reports the temp dir as `/var` for `/private/var`; Windows may
     /// report an 8.3 short name).
+    /// The key of a deleted folder `missing` directly under the surviving
+    /// `parent`: the parent in resolved form (the OS temp dir is a short
+    /// `RUNNER~1` name on Windows CI and `/var` for `/private/var` on macOS)
+    /// plus the missing name.
+    fn resolved_key(parent: &Path, missing: &str) -> Option<String> {
+        let resolved = std::fs::canonicalize(parent).unwrap();
+        let parent = PathBuf::from(strip_verbatim_prefix(&resolved.to_string_lossy()));
+        Some(normalize_project_path(&parent.join(missing).to_string_lossy()))
+    }
+
     fn canonical_key(path: &Path) -> Option<String> {
         let resolved = std::fs::canonicalize(path).unwrap();
         Some(normalize_project_path(&strip_verbatim_prefix(&resolved.to_string_lossy())))
@@ -1255,7 +1266,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let deleted = dir.path().join("gone-project");
 
-        assert_eq!(resolve(&deleted, policy(dir.path(), &[])), key(&deleted));
+        assert_eq!(resolve(&deleted, policy(dir.path(), &[])), resolved_key(dir.path(), "gone-project"));
     }
 
     /// A repo that was renamed or deleted leaves session cwds in its
@@ -1274,7 +1285,7 @@ mod tests {
             gone.join(".claude").join("worktrees").join("agent-x"),
             gone.join("hotbar-tauri").join("src-tauri"),
         ] {
-            assert_eq!(resolve(&sub, p()), key(&gone), "{}", sub.display());
+            assert_eq!(resolve(&sub, p()), resolved_key(dir.path(), "herdr-omniroute"), "{}", sub.display());
         }
     }
 
@@ -1302,10 +1313,7 @@ mod tests {
         let temp = dir.path().join("Temp");
         let sibling = dir.path().join("Temp-projects").join("app");
 
-        assert_eq!(
-            resolve(&sibling, policy(dir.path(), &[&temp])),
-            key(&dir.path().join("Temp-projects"))
-        );
+        assert_eq!(resolve(&sibling, policy(dir.path(), &[&temp])), resolved_key(dir.path(), "Temp-projects"));
     }
 
     /// Windows paths are case-insensitive: the agent may record the temp dir
