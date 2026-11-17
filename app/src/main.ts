@@ -21,6 +21,7 @@ import {
   agentFromAction,
   buildPanelViewModel,
   isUsageAction,
+  projectToggleLabel,
   WINDOW_OPTIONS,
   type AgentSectionViewModel,
   type TimeWindow,
@@ -647,7 +648,7 @@ function setPanelUi(open: boolean): void {
 /**
  * Token-usage panel: renders `get_usage(window)` for either every agent
  * (`agent-usage`) or one agent (`agent-usage:<agent>`): status, totals,
- * cost, then up to 5 top projects. There is no refresh timer — the panel
+ * cost, then the top 5 projects, expandable to every project. There is no refresh timer — the panel
  * fetches on open and on window change only, never background polling.
  */
 
@@ -660,14 +661,18 @@ let usageWindow: TimeWindow = "today";
 /** Guards against a stale response winning a race when the panel is
  * reopened, or the window changed, before the previous fetch resolved. */
 let usageFetchToken = 0;
+/** Agents whose project list is expanded past the top 5. Session-only like
+ * the window: cleared whenever the panel opens from closed. */
+const usageExpandedAgents = new Set<string>();
 
 function usageStatusBadge(status: AgentSectionViewModel["status"]): string {
   if (status.state === "ok") return "";
   return status.state === "notInstalled" ? " (not installed)" : " (error)";
 }
 
-/** One agent's block: name/status, totals, cost, then its top projects. */
-function renderUsageSection(section: AgentSectionViewModel): HTMLElement {
+/** One agent's block: name/status, totals, cost, then its top projects.
+ * `onToggleProjects` expands or collapses this agent's project list. */
+function renderUsageSection(section: AgentSectionViewModel, onToggleProjects: () => void): HTMLElement {
   const el = document.createElement("div");
   el.className = "usage-section";
 
@@ -732,6 +737,17 @@ function renderUsageSection(section: AgentSectionViewModel): HTMLElement {
     el.appendChild(projects);
   }
 
+  const toggleLabel = projectToggleLabel(section);
+  if (toggleLabel) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "usage-projects-toggle";
+    toggle.textContent = toggleLabel;
+    toggle.setAttribute("aria-expanded", String(section.expanded));
+    toggle.addEventListener("click", onToggleProjects);
+    el.appendChild(toggle);
+  }
+
   return el;
 }
 
@@ -784,9 +800,12 @@ function renderUsageResult(
   snapshot: UsageSnapshot,
   filterAgent: string | null,
 ): void {
+  // Keep the scroll position across an expand/collapse re-render.
+  const scroller = body.closest<HTMLElement>(".panel");
+  const scrollTop = scroller?.scrollTop ?? 0;
   body.replaceChildren();
   body.appendChild(renderWindowSelector(onWindowChange));
-  const vm = buildPanelViewModel(snapshot, filterAgent);
+  const vm = buildPanelViewModel(snapshot, filterAgent, usageExpandedAgents);
   if (vm.sections.length === 0) {
     const empty = document.createElement("div");
     empty.className = "usage-line usage-line--dim";
@@ -795,8 +814,14 @@ function renderUsageResult(
     return;
   }
   for (const section of vm.sections) {
-    body.appendChild(renderUsageSection(section));
+    const onToggleProjects = (): void => {
+      if (usageExpandedAgents.has(section.agent)) usageExpandedAgents.delete(section.agent);
+      else usageExpandedAgents.add(section.agent);
+      renderUsageResult(body, onWindowChange, snapshot, filterAgent);
+    };
+    body.appendChild(renderUsageSection(section, onToggleProjects));
   }
+  if (scroller) scroller.scrollTop = scrollTop;
 }
 
 /**
@@ -1312,7 +1337,10 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (isUsageAction(action)) {
           // Opening from closed starts on Today; switching agent while the
           // panel is already open keeps the user's current selection.
-          if (!panelOpen) usageWindow = "today";
+          if (!panelOpen) {
+            usageWindow = "today";
+            usageExpandedAgents.clear();
+          }
           activePanelAction = action;
           await openUsagePanel(action, body, togglePanel);
           return;

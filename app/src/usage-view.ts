@@ -5,8 +5,8 @@
  *
  * Mirrors the Rust shapes serialized by `get_usage`
  * (app/src-tauri/src/usage/mod.rs), camelCase throughout. What the panel
- * shows: per agent status, totals, cost, then up to 5 top projects by
- * output tokens.
+ * shows: per agent status, totals, cost, then the top 5 projects by output
+ * tokens, expandable to every project.
  */
 
 export type TimeWindow = "today" | "last7Days" | "last30Days" | "thisMonth";
@@ -153,13 +153,13 @@ function parentSegment(path: string): string | null {
 
 /**
  * Two sibling checkouts can share a leaf folder name (e.g. two
- * "src-tauri" projects) and land side by side in the same agent's top-5
+ * "src-tauri" projects) and land side by side in the same agent's project
  * list with nothing to tell them apart. When a name collides within the
  * list actually being shown, this prefixes the parent folder so the rows
  * stay distinct (e.g. "app/src-tauri" vs "tools/src-tauri"); a name that
  * is unique in the list is left alone. Collisions are only checked within
- * `projects` (the already-truncated top-5), not the full project set, since
- * that is what the user sees together.
+ * `projects` (the rows actually shown: the top 5, or every project when the
+ * section is expanded), since that is what the user sees together.
  */
 export function disambiguateProjectNames(projects: ProjectUsage[]): string[] {
   const counts = new Map<string, number>();
@@ -185,19 +185,35 @@ export interface AgentSectionViewModel {
     entries: string;
     cost: string;
   } | null;
+  /** The rows to render: the top `MAX_PROJECTS_SHOWN`, or every project when
+   * the section is expanded. */
   topProjects: ProjectLineViewModel[];
+  /** Every project the agent has in the window, shown or not. When it is
+   * larger than `MAX_PROJECTS_SHOWN` the panel offers to expand or collapse
+   * the list. */
+  projectCount: number;
+  expanded: boolean;
 }
 
-/** Max projects shown per agent. */
+/** Projects shown per agent until the section is expanded. */
 export const MAX_PROJECTS_SHOWN = 5;
+
+/** Label of the control that expands or collapses an agent's project list;
+ * `null` when every project already fits in the top 5. */
+export function projectToggleLabel(section: AgentSectionViewModel): string | null {
+  if (section.projectCount <= MAX_PROJECTS_SHOWN) return null;
+  return section.expanded
+    ? `Show top ${MAX_PROJECTS_SHOWN}`
+    : `Show all ${section.projectCount} projects`;
+}
 
 /**
  * Builds the display model for one agent report. `totals` is `null` when the
  * agent is not `ok`, since there is nothing honest to show beyond the status.
  * Projects are already sorted by output tokens descending by the Rust side
- * (`AgentUsageReport::ok`); this only truncates to the top 5.
+ * (`AgentUsageReport::ok`); this truncates to the top 5 unless `expanded`.
  */
-export function buildAgentSection(report: AgentUsageReport): AgentSectionViewModel {
+export function buildAgentSection(report: AgentUsageReport, expanded = false): AgentSectionViewModel {
   const isOk = report.status.state === "ok";
   return {
     agent: report.agent,
@@ -220,7 +236,7 @@ export function buildAgentSection(report: AgentUsageReport): AgentSectionViewMod
       : null,
     topProjects: isOk
       ? (() => {
-          const top = report.projects.slice(0, MAX_PROJECTS_SHOWN);
+          const top = expanded ? report.projects : report.projects.slice(0, MAX_PROJECTS_SHOWN);
           const names = disambiguateProjectNames(top);
           return top.map((p, i) => ({
             name: names[i],
@@ -230,6 +246,8 @@ export function buildAgentSection(report: AgentUsageReport): AgentSectionViewMod
           }));
         })()
       : [],
+    projectCount: isOk ? report.projects.length : 0,
+    expanded,
   };
 }
 
@@ -241,18 +259,20 @@ export interface UsagePanelViewModel {
 /**
  * Builds the panel view model for a snapshot. `filterAgent` narrows to a
  * single agent (the `agent-usage:<agent>` action); omitted or unmatched shows
- * every agent, same as the plain `agent-usage` action.
+ * every agent, same as the plain `agent-usage` action. `expandedAgents` names
+ * the agents whose project list shows every project instead of the top 5.
  */
 export function buildPanelViewModel(
   snapshot: UsageSnapshot,
   filterAgent?: string | null,
+  expandedAgents: ReadonlySet<string> = new Set(),
 ): UsagePanelViewModel {
   const agents = filterAgent
     ? snapshot.agents.filter((a) => a.agent === filterAgent)
     : snapshot.agents;
   return {
     window: snapshot.window,
-    sections: agents.map(buildAgentSection),
+    sections: agents.map((a) => buildAgentSection(a, expandedAgents.has(a.agent))),
   };
 }
 

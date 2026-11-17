@@ -272,6 +272,9 @@ started in a folder that is not inside any Git repository (such as your home
 folder). A project whose folder was renamed or deleted still appears, as one
 row named after the folder that is gone.
 
+Each agent lists its 5 busiest projects by output tokens; **Show all N
+projects** under the list expands it to every project in the window.
+
 ## Extensions
 
 Orbitbar has optional extensions for the Herdr TUI and the
