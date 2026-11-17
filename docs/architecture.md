@@ -162,7 +162,14 @@ beyond wiring the new item's `action` to the new `invoke()` call.
   SQLite is compiled into the binary and needs no system library on any OS.
 - The window is transparent, frameless and always-on-top through Tauri's
   own window flags (`tauri.conf.json`), which map to the native APIs of
-  each OS without extra code here.
+  each OS without extra code here. On macOS transparency also needs
+  `app.macOSPrivateApi` in `tauri.conf.json` and Tauri's `macos-private-api`
+  feature in `Cargo.toml`; without them the bar sits on a white box.
+- The bar (72x400), the collapsed tab (46x46) and the panel and menu widths
+  are CSS pixels. Placement works in physical pixels, so every size is scaled
+  with the monitor's scale factor first (`cssToPhysical` in
+  `placement-view.ts`, `placement::physical_size` in Rust): on a scale-2
+  Retina screen the bar's window is 144x800.
 - Autostart uses `tauri-plugin-autostart`, which registers the native
   mechanism per platform: a Registry Run entry on Windows, a LaunchAgent on
   macOS and an XDG autostart `.desktop` entry on Linux. `config.json`'s

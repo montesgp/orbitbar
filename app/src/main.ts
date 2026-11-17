@@ -10,6 +10,7 @@ import {
   barFromWindow,
   barMoved,
   collapsedTabDyCss,
+  cssToPhysical,
   physicalToCss,
   requestKey,
   type Rect,
@@ -81,10 +82,13 @@ export interface ConfigPayload {
 }
 
 /**
- * Physical window sizes, ported 1:1 from the measured WPF v1 window. The bar is
- * a 72x400 crescent; the collapsed state is a 46x46 tab. These MUST match the
- * constants in src-tauri/src/lib.rs, which sizes the window before the webview
- * paints — a mismatch shows up as a clipped crescent, not a layout bug.
+ * Bar sizes in CSS pixels, ported 1:1 from the measured WPF v1 window. The bar
+ * is a 72x400 crescent; the collapsed state is a 46x46 tab. These MUST match
+ * the constants in src-tauri/src/lib.rs, which sizes the window before the
+ * webview paints — a mismatch shows up as a clipped crescent, not a layout bug.
+ * Every size here (bar, panel, menu) is CSS pixels and goes through
+ * `cssToPhysical` before it reaches Rust, which works in physical pixels: on a
+ * scale-2 Retina screen the window must be 144x800 for a 72x400 bar.
  */
 const SIZE_COLLAPSED: Size = { width: 46, height: 46 };
 const SIZE_EXPANDED: Size = { width: 72, height: 400 };
@@ -264,7 +268,7 @@ let placementQueue: Promise<unknown> = Promise.resolve();
 async function initPlacement(cfg: OrbitbarConfig): Promise<void> {
   const pos = await win.outerPosition();
   scaleFactor = await win.scaleFactor();
-  const rect = { x: pos.x, y: pos.y, ...barSizeFor(cfg.collapsed) };
+  const rect = { x: pos.x, y: pos.y, ...cssToPhysical(barSizeFor(cfg.collapsed), scaleFactor) };
   placement = { bar: rect, window: rect, side: "left", barOffset: { x: 0, y: 0 }, monitor: null };
   placementKey = null;
 }
@@ -276,8 +280,7 @@ function setBarDy(cssPx: number): void {
 }
 
 /** Draws the menu/panel on the side Rust chose. The bar offset arrives in
- * physical pixels and is converted for CSS. The bar's own 72x400 geometry
- * stays a fixed physical-equals-CSS assumption, as it always was. */
+ * physical pixels and is converted for CSS. */
 function applyLayout(p: Placement): void {
   document.body.classList.toggle("side-right", p.side === "right");
   setBarDy(physicalToCss(p.barOffset.y, scaleFactor));
@@ -339,10 +342,10 @@ function applyAndRemember(
 async function placeNow(cfg: OrbitbarConfig, panelOpen: boolean, menuOpen: boolean): Promise<Placement> {
   const last = placement;
   if (!last) throw new Error("placement not initialised");
-  const size = barSizeFor(cfg.collapsed);
-  const extra = extraFor(cfg.collapsed, panelOpen, menuOpen);
   const pos = await win.outerPosition();
   scaleFactor = await win.scaleFactor();
+  const size = cssToPhysical(barSizeFor(cfg.collapsed), scaleFactor);
+  const extra = cssToPhysical(extraFor(cfg.collapsed, panelOpen, menuOpen), scaleFactor);
   const bar = barFromWindow(pos, last);
   // Re-placing the geometry the window already has still makes the OS repaint
   // it, so an unchanged request is skipped.
@@ -1088,7 +1091,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         // The tab ends up centered on the bar's center (Rust keeps that
         // point), so paint it there in the window that is still tall.
         if (placement) {
-          setBarDy(collapsedTabDyCss(placement.window.height, SIZE_COLLAPSED.height, scaleFactor));
+          const tab = cssToPhysical(SIZE_COLLAPSED, scaleFactor);
+          setBarDy(collapsedTabDyCss(placement.window.height, tab.height, scaleFactor));
         }
         setCollapsedUi(true);
         // Collapsing re-anchors the bar, so its position changed.

@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{Manager, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
 
-/// Physical window sizes for the two visual states (must match src/main.ts).
-/// The expanded bar is a 72x400 crescent and the collapsed state is a 46x46
-/// tab, both ported from the measured WPF v1 window. tauri.conf.json declares
-/// the same expanded size so the window is born at the right shape.
+/// Window sizes for the two visual states in CSS (logical) pixels (must match
+/// src/main.ts). The expanded bar is a 72x400 crescent and the collapsed state
+/// is a 46x46 tab, both ported from the measured WPF v1 window. They are
+/// scaled to physical pixels with the monitor's scale factor before use (see
+/// `placement::physical_size`). tauri.conf.json declares the same expanded
+/// size so the window is born at the right shape.
 const SIZE_COLLAPSED: (u32, u32) = (46, 46);
 const SIZE_EXPANDED: (u32, u32) = (72, 400);
 
@@ -358,7 +360,8 @@ pub fn run() {
             // (the webview's min-content width plus a frame), which pushed 56px
             // off the right edge of a 1080 monitor and made the right-center
             // placement aim at an edge that was not there.
-            let size = if cfg.collapsed { SIZE_COLLAPSED } else { SIZE_EXPANDED };
+            let css = if cfg.collapsed { SIZE_COLLAPSED } else { SIZE_EXPANDED };
+            let size = placement::physical_size(css, window.scale_factor()?);
             let areas: Vec<placement::Rect> = window.available_monitors()?.iter().map(work_rect).collect();
             let fallback = work_rect(&resolve_monitor(&window, &cfg.monitor)?);
             let bar = placement::restore_bar(cfg.position.map(|p| (p.x, p.y)), size, &areas, fallback, cfg.margin);
