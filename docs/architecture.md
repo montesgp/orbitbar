@@ -4,7 +4,7 @@
 
 Orbitbar is a Tauri 2 desktop app: a Rust core plus a TypeScript/HTML
 frontend, packaged as one native binary per OS (Windows, macOS, Linux). It
-reads the token-usage history that Claude Code, Codex and OpenCode write to
+reads the token-usage history that Claude Code, Codex, OpenCode and Pi write to
 disk, prices it, and renders it in a small always-on-top bar, overall and per
 project. Installation and usage are covered in the [root README](../README.md).
 
@@ -33,21 +33,26 @@ flowchart LR
     RC["claude.rs"]
     RX["codex.rs"]
     RO["opencode.rs"]
+    RP["pi.rs"]
   end
   subgraph SRC["Local files the agents wrote"]
     direction TB
     CC["~/.claude/projects/**/*.jsonl"]
     CX["~/.codex/sessions/**/*.jsonl"]
     OP["~/.local/share/opencode/opencode.db"]
+    PI["~/.pi/agent/sessions/**/*.jsonl"]
   end
 
   MAIN -->|"invoke()"| CMD
   USAGE --> RC
   USAGE --> RX
   USAGE --> RO
+  USAGE --> RP
+  RP -.->|"claude-bridge check"| RC
   RC -->|"read-only"| CC
   RX -->|"read-only"| CX
   RO -->|"read-only SQLite"| OP
+  RP -->|"read-only"| PI
   CMD -->|"JSON payload"| MAIN
 ```
 
@@ -66,7 +71,7 @@ through Tauri's `invoke()` IPC.
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
 | Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
-| Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the other two |
+| Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
 | Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket on its own |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
@@ -111,21 +116,27 @@ through Tauri's `invoke()` IPC.
    `TimeWindow` (`today` / `last7Days` / `last30Days` / `thisMonth` /
    `last365Days`, today plus the previous 364 days),
    starting with `today`.
-2. `get_usage` (in `lib.rs`) resolves the three store paths under the
+2. `get_usage` (in `lib.rs`) resolves the four store paths under the
    user's home directory, loads `pricing.json` if present, and runs the
    whole read off the main thread (`spawn_blocking`) so a large history
    never stalls the window.
-3. `usage::collect_usage` calls each reader — `claude::read_usage`,
-   `codex::read_usage`, `opencode::read_usage` — independently. Each
+3. `usage::collect_usage` calls each reader, in the order the snapshot
+   lists them — `claude::read_daily` plus `claude::report`,
+   `codex::read_usage`, `opencode::read_usage`, `pi::read_usage`. Each
    returns an `AgentUsageReport` with its own `AgentStatus`
    (`Ok` / `NotInstalled` / `Error`), so one broken agent store never hides
-   the other two.
-4. Claude and Codex totals are priced through `pricing::estimate_cost`
+   the others. Pi is the one reader that takes another's data: its
+   `claude-bridge` turns are Claude Code sessions, also in Claude's
+   transcripts with no shared id, so `pi::read_daily` counts one only for a
+   `(date, project)` that Claude's daily buckets lack, and the report's
+   `detail` says how many it left out. Every other Pi provider always
+   counts.
+4. Claude, Codex and Pi totals are priced through `pricing::estimate_cost`
    against the built-in table plus any `pricing.json` overrides; OpenCode
    already carries its own reported cost and skips pricing entirely.
-   Claude entries carry their own timestamps, so `claude::read_daily`
+   Claude and Pi entries carry their own timestamps, so their `read_daily`
    sorts them into `(local date, project key)` buckets of raw counters plus
-   the bucket's last model (`usage::daily`), and `claude::report` folds the
+   the bucket's last model (`usage::daily`), and their `report` folds the
    window's dates: each bucket is priced with its own model and the amounts
    summed, so a total's cost is missing only when no bucket in it has a
    price.
@@ -136,7 +147,7 @@ through Tauri's `invoke()` IPC.
 ## Adding a new agent reader
 
 Each reader is self-contained and returns the same shape, so adding one
-does not touch the other two:
+does not touch the others:
 
 1. Add `app/src-tauri/src/usage/<agent>.rs` with a
    `pub fn read_usage(root: &Path, start: DateTime<Local>, end: DateTime<Local>, ...) -> AgentUsageReport`,
@@ -146,7 +157,10 @@ does not touch the other two:
    resolution rule in `resolve_paths`, and a call inside `collect_usage`.
 3. If the new agent reports cost per session already, skip pricing for it
    the way `opencode.rs` does; if it only reports tokens, price it through
-   `pricing::estimate_cost` the way `claude.rs`/`codex.rs` do.
+   `pricing::estimate_cost` the way `claude.rs`/`codex.rs`/`pi.rs` do. A
+   store whose entries carry their own timestamps can fill
+   `usage::daily::DailyBuckets` and fold them, the way `claude.rs` and
+   `pi.rs` do.
 4. Add the agent to `app/src/usage-view.ts`'s types and rendering, and a
    default item (`agent-usage:<agent>`) in `config.rs::default_items` if it
    should get its own cell.
@@ -208,5 +222,6 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src-tauri/src/usage/claude.rs` | Claude Code JSONL reader |
 | `app/src-tauri/src/usage/codex.rs` | Codex CLI JSONL reader |
 | `app/src-tauri/src/usage/opencode.rs` | OpenCode SQLite reader |
+| `app/src-tauri/src/usage/pi.rs` | Pi JSONL reader, with the `claude-bridge` check against Claude's buckets |
 | `app/src-tauri/src/usage/pricing.rs` | Built-in price table, `pricing.json` override loading, cost estimation |
 | `extensions/` | Optional Herdr and OmniRoute integrations, see [extensions/README.md](../extensions/README.md) |

@@ -84,7 +84,6 @@ impl DailyBuckets {
         self.buckets.get(&(date, project.to_string()))
     }
 
-    #[allow(dead_code)] // first caller: the Pi reader's claude-bridge check
     pub fn contains(&self, date: NaiveDate, project: &str) -> bool {
         self.get(date, project).is_some()
     }

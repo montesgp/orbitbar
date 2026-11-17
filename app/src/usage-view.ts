@@ -79,6 +79,7 @@ const AGENT_DISPLAY_NAMES: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
   opencode: "OpenCode",
+  pi: "Pi",
 };
 
 /** The label the panel shows for an agent id; unknown ids pass through unchanged. */

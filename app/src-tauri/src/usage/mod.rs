@@ -1,17 +1,18 @@
-//! Token-spend usage readers: claude, codex and opencode, each read from the
+//! Token-spend usage readers: claude, codex, opencode and pi, each read from the
 //! agent's own local files, no external service or program involved. The
 //! per-agent modules below own the deduplication, cumulative-vs-summed
 //! counter handling and windowing each store needs.
 //!
 //! One function, [`collect_usage`], returns a per-agent breakdown for a time
 //! window plus a per-project split sorted by output tokens. A broken or
-//! missing store on one agent never hides the other two: each carries its own
+//! missing store on one agent never hides the others: each carries its own
 //! [`AgentStatus`].
 
 pub mod claude;
 pub mod codex;
 pub mod daily;
 pub mod opencode;
+pub mod pi;
 pub mod pricing;
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone};
@@ -204,7 +205,7 @@ impl AgentUsageReport {
     }
 }
 
-/// The three store roots, resolved from a home directory. Readers take their
+/// The agents' store roots, resolved from a home directory. Readers take their
 /// root as a parameter (never resolve it themselves) so tests can point them
 /// at fixtures.
 #[derive(Debug, Clone)]
@@ -212,9 +213,10 @@ pub struct UsagePaths {
     pub claude_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub opencode_db: PathBuf,
+    pub pi_dir: PathBuf,
 }
 
-/// Resolves the three store roots under a home directory. `home_override`
+/// Resolves the store roots under a home directory. `home_override`
 /// lets tests and the parity harness point at a fixture home instead of the
 /// real one; the ordinary caller passes `None` and gets `dirs::home_dir()`.
 ///
@@ -236,6 +238,7 @@ pub fn resolve_paths(home_override: Option<&Path>) -> Option<UsagePaths> {
             .join("share")
             .join("opencode")
             .join("opencode.db"),
+        pi_dir: home.join(".pi").join("agent").join("sessions"),
     })
 }
 
@@ -281,7 +284,7 @@ pub fn project_display_name(key: &str) -> String {
 /// codex and opencode all report many sessions that share the same cwd
 /// (subagents, resumed sessions, several projects under one parent), so a
 /// shared cache means the filesystem is walked at most once per distinct
-/// cwd across all three readers, not once per session.
+/// cwd across all the readers, not once per session.
 pub struct ProjectRootCache {
     policy: RootPolicy,
     resolved: HashMap<String, Option<String>>,
@@ -505,7 +508,7 @@ pub(crate) fn find_jsonl_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// One snapshot of all three agents for a time window - the shape the
+/// One snapshot of every agent for a time window - the shape the
 /// `get_usage` Tauri command returns.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -522,9 +525,11 @@ pub struct UsageSnapshot {
     pub pricing_warning: Option<String>,
 }
 
-/// Reads all three agents for `window`, as of `now`, pricing claude/codex
-/// against `overrides` layered on top of the built-in table (see
-/// `pricing::find_price_entry`). Sequential: three bounded, independent reads
+/// Reads every agent for `window`, as of `now`, in the order claude, codex,
+/// opencode, pi, pricing claude/codex/pi against `overrides` layered on top
+/// of the built-in table (see `pricing::find_price_entry`). Pi reads after
+/// claude because its claude-bridge turns count only where Claude's daily
+/// buckets have no `(date, project)`. Sequential: bounded, independent reads
 /// are cheaper than the coordination a parallel version would need, and a
 /// broken one never blocks the others because each is wrapped in its own
 /// `AgentUsageReport`.
@@ -537,16 +542,23 @@ pub fn collect_usage(
     let (start, end) = window_range(window, now);
     let mut root_cache = ProjectRootCache::new();
 
-    let claude = claude::read_usage(&paths.claude_dir, start, end, overrides, &mut root_cache);
+    // Claude's buckets stay around for pi, whose claude-bridge turns count
+    // only where Claude has no bucket of its own.
+    let claude_daily = claude::read_daily(&paths.claude_dir, &mut root_cache);
+    let (claude, claude_buckets) = match claude_daily {
+        Ok(daily) => (claude::report(&daily, start.date_naive(), end.date_naive(), overrides), daily.buckets),
+        Err(report) => (*report, daily::DailyBuckets::default()),
+    };
     let codex = codex::read_usage(&paths.codex_dir, start, end, overrides, &mut root_cache);
     let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache);
+    let pi = pi::read_usage(&paths.pi_dir, &claude_buckets, start, end, overrides, &mut root_cache);
 
     UsageSnapshot {
         window,
         window_start: start.to_rfc3339(),
         window_end: end.to_rfc3339(),
         generated_at: now.to_rfc3339(),
-        agents: vec![claude, codex, opencode],
+        agents: vec![claude, codex, opencode, pi],
         pricing_warning: None,
     }
 }
@@ -669,6 +681,67 @@ mod tests {
             paths.opencode_db,
             home.join(".local").join("share").join("opencode").join("opencode.db")
         );
+        assert_eq!(paths.pi_dir, home.join(".pi").join("agent").join("sessions"));
+    }
+
+    /// Every agent is reported, in a fixed order with pi last, even when
+    /// none of the stores exist.
+    #[test]
+    fn collect_usage_reports_claude_codex_opencode_then_pi() {
+        let dir = tempdir().unwrap();
+        let paths = resolve_paths(Some(dir.path())).unwrap();
+        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default());
+
+        let agents: Vec<&str> = snapshot.agents.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(agents, vec!["claude", "codex", "opencode", "pi"]);
+        assert!(snapshot.agents.iter().all(|a| a.status == AgentStatus::NotInstalled));
+    }
+
+    /// Pi's `claude-bridge` turns are checked against the Claude buckets of
+    /// the same snapshot: a day Claude has is not counted twice.
+    #[test]
+    fn collect_usage_leaves_out_bridge_turns_claude_already_counts() {
+        let dir = tempdir().unwrap();
+        let paths = resolve_paths(Some(dir.path())).unwrap();
+        let now = local(2026, 9, 15, 18, 0);
+        let ts = |h: u32| local(2026, 9, 15, h, 0).to_utc().to_rfc3339();
+        // No cwd on either side: both land in the no-project bucket, so the
+        // test never depends on the machine's real temp or home directory.
+        std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
+        std::fs::write(
+            paths.claude_dir.join("p").join("s.jsonl"),
+            format!(
+                "{}\n",
+                format_args!(r#"{{"requestId":"r1","timestamp":"{}","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":10}}}}}}"#, ts(9))
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.pi_dir.join("p")).unwrap();
+        let pi_turn = |id: &str, provider: &str, output: u64| {
+            format!(
+                r#"{{"type":"message","id":"{id}","timestamp":"{}","message":{{"role":"assistant","provider":"{provider}","model":"gpt-5.5","usage":{{"input":1,"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":0}}}}}}"#,
+                ts(10)
+            )
+        };
+        std::fs::write(
+            paths.pi_dir.join("p").join("s.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session","id":"s","cwd":""}"#,
+                pi_turn("b", "claude-bridge", 10),
+                pi_turn("c", "openai-codex", 7),
+            ),
+        )
+        .unwrap();
+
+        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default());
+        let claude = &snapshot.agents[0];
+        let pi = &snapshot.agents[3];
+        assert_eq!(claude.totals.output_tokens, 10);
+        assert_eq!(pi.agent, "pi");
+        assert_eq!(pi.totals.entries, 1);
+        assert_eq!(pi.totals.output_tokens, 7);
+        assert!(pi.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", pi.detail);
     }
 
     #[test]
@@ -949,7 +1022,7 @@ mod tests {
     /// Not a unit test: prints the real home directory's ThisMonth snapshot
     /// so it can be sanity-checked by hand against what the agents' own UIs
     /// report. `--ignored` because it depends on this machine's real
-    /// `.claude` / `.codex` / opencode stores, which do not exist in CI or on
+    /// `.claude` / `.codex` / opencode / `.pi` stores, which do not exist in CI or on
     /// a fresh checkout.
     ///
     /// Run with: `cargo test -- --ignored parity --nocapture`
@@ -971,6 +1044,7 @@ mod tests {
                 agent.totals.cost,
                 agent.projects.len()
             );
+            println!("          detail: {}", agent.detail);
         }
     }
 }

@@ -4,7 +4,7 @@
 
 Orbitbar is a small bar that stays where you put it on your screen, always
 visible above your other windows. It shows the token usage and cost of your local AI
-coding agents (Claude Code, Codex and OpenCode): overall, per project, and
+coding agents (Claude Code, Codex, OpenCode and Pi): overall, per project, and
 for the time window you pick. It runs on Windows, macOS and Linux.
 
 | Dark | Light |
@@ -184,8 +184,8 @@ Item actions:
 
 | Action | What it does |
 | --- | --- |
-| `agent-usage` | Opens the usage panel with all three agents. |
-| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode` | Opens the panel for one agent. |
+| `agent-usage` | Opens the usage panel with every agent. |
+| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode`, `agent-usage:pi` | Opens the panel for one agent. Pi has no cell of its own by default. |
 | `toggle-autostart` | Turns autostart on or off and updates the OS entry. |
 | `edit-config` | Opens the bar's menu at the click; "Edit config" there opens `config.json` in your default editor. |
 | `open:<url>` | Opens an `http://` or `https://` URL in your default browser. Other schemes are rejected and the panel shows why. |
@@ -260,9 +260,15 @@ with a warning.
 | Claude Code | `~/.claude/projects/**/*.jsonl` | Read-only |
 | Codex | `~/.codex/sessions/**/*.jsonl` | Read-only |
 | OpenCode | `~/.local/share/opencode/opencode.db` | Read-only SQLite |
+| Pi | `~/.pi/agent/sessions/**/*.jsonl` | Read-only |
 
 `~` is your home directory on every OS. See
 [docs/architecture.md](docs/architecture.md) for how the readers work.
+
+Pi turns run through its `claude-bridge` provider are Claude Code sessions,
+so Claude Code's own files hold them too. Pi counts them only for a day and
+project that Claude has no usage for, and its panel says how many it left
+out; turns from every other Pi provider always count.
 
 Usage is grouped by project: the repository a session ran in. Runs that are
 not part of a project are not counted, neither in the project list nor in the

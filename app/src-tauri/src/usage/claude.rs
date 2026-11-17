@@ -42,6 +42,8 @@ pub struct ClaudeDaily {
 /// Reads month/window usage from every claude session file under `root`,
 /// pricing against `overrides` layered on top of the built-in table: a
 /// [`read_daily`] scan folded over the local dates in `[start, end)`.
+/// `collect_usage` calls the two steps itself to hand Claude's buckets to pi.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_usage(
     root: &Path,
     start: DateTime<Local>,

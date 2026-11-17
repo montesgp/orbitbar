@@ -292,7 +292,7 @@ pub fn ensure_pricing_file(path: &PathBuf) -> Result<(), String> {
 }
 
 fn default_items() -> Vec<Item> {
-    let tooltip = "none | agent-usage | agent-usage:claude | agent-usage:codex | agent-usage:opencode | open:<url> | run:<program> [args] | panel:<program> [args] | edit-config";
+    let tooltip = "none | agent-usage | agent-usage:claude | agent-usage:codex | agent-usage:opencode | agent-usage:pi | open:<url> | run:<program> [args] | panel:<program> [args] | edit-config";
     vec![
         Item {
             id: "claude".into(),
@@ -323,7 +323,7 @@ fn default_items() -> Vec<Item> {
             label: "usage".into(),
             glyph: "0x0024".into(),
             action: "agent-usage".into(),
-            tooltip: "Live session usage (claude/codex/opencode) - real-time balance".into(),
+            tooltip: "Live session usage (claude/codex/opencode/pi) - real-time balance".into(),
             example: false,
         },
         Item {
@@ -562,6 +562,18 @@ mod tests {
         let pos = pos.expect("default items must carry the GitHub cell");
         assert_eq!(items[pos].id, "github");
         assert_eq!(items[pos + 1].id, "settings");
+    }
+
+    /// Pi has no default cell, so the agent cells' tooltips are where the
+    /// `agent-usage:pi` action is listed; the default cells stay the same.
+    #[test]
+    fn the_agent_cell_tooltips_list_the_pi_action_without_a_pi_cell() {
+        let items = default_items();
+        for id in ["claude", "codex", "opencode"] {
+            let item = items.iter().find(|i| i.id == id).expect("agent cell");
+            assert!(item.tooltip.contains("agent-usage:opencode | agent-usage:pi |"), "{}", item.tooltip);
+        }
+        assert!(items.iter().all(|i| i.action != "agent-usage:pi"));
     }
 
     /// The default set must stay usable: the bar renders nothing if there is
