@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const AGENT: &str = "pi";
+pub const AGENT: &str = "pi";
 
 /// The provider whose turns Claude Code's transcripts already hold.
 const CLAUDE_BRIDGE: &str = "claude-bridge";
@@ -44,6 +44,8 @@ pub struct PiDaily {
 /// Reads window usage from every pi session file under `root`, pricing
 /// against `overrides`: a [`read_daily`] scan folded over the local dates in
 /// `[start, end)`. `claude` holds the `(date, project)` buckets Claude counts.
+/// `collect_usage` calls the two steps itself to merge the ledger in between.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_usage(
     root: &Path,
     claude: &DailyBuckets,
@@ -162,7 +164,8 @@ pub fn read_daily(
 /// priced with its own model; a cache write is priced as a 5-minute write,
 /// since Pi does not split it by TTL.
 pub fn report(daily: &PiDaily, start: NaiveDate, end: NaiveDate, overrides: &pricing::PriceOverrides) -> AgentUsageReport {
-    if daily.files_scanned == 0 {
+    // With no session file left, the ledger may still hold days to fold.
+    if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
         return AgentUsageReport::ok(AGENT, UsageTotals::default(), Vec::new(), "no session files yet");
     }
 

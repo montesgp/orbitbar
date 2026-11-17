@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const AGENT: &str = "claude";
+pub const AGENT: &str = "claude";
 
 /// Everything one scan of the store found, before any window is applied.
 #[derive(Debug, Clone, Default)]
@@ -177,7 +177,8 @@ pub fn report(
     end: NaiveDate,
     overrides: &pricing::PriceOverrides,
 ) -> AgentUsageReport {
-    if daily.files_scanned == 0 {
+    // With no session file left, the ledger may still hold days to fold.
+    if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
         return AgentUsageReport::ok(AGENT, UsageTotals::default(), Vec::new(), "no session files yet");
     }
 

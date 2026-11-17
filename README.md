@@ -22,6 +22,9 @@ for the time window you pick. It runs on Windows, macOS and Linux.
 - **Local data only.** Orbitbar reads the session history your agents
   already keep on disk. It needs no account, sends no telemetry and makes no
   network calls.
+- **A year of history.** Orbitbar keeps its own daily totals for Claude Code
+  and Pi, so usage stays visible after an agent deletes old sessions. See
+  [History](#history).
 - **Sourced prices.** A built-in price table with a per-user override file.
   A model without a price entry shows `no price data`.
 - **Light and dark themes**, switched live from the bar's menu.
@@ -282,6 +285,20 @@ project, named by the path the link points to.
 
 Each agent lists its 5 busiest projects by output tokens; **Show all N
 projects** under the list expands it to every project in the window.
+
+### History
+
+Claude Code deletes session files older than its `cleanupPeriodDays` setting
+(30 days unless you change it in `~/.claude/settings.json`), so their usage
+would drop out of the panel. Orbitbar keeps daily totals per project for
+Claude Code and Pi in `usage-ledger.json`, next to `config.json`, and keeps
+them for 365 days. It holds token counts and the model only; costs are
+computed when the panel opens, so `pricing.json` still applies. Codex and
+OpenCode keep their whole history in their own stores, so they are not in it.
+
+`usage-ledger.json` is the only file Orbitbar writes for usage; the agents'
+files above are only read. If the ledger cannot be read, Orbitbar leaves it
+as it is, shows the agents' own data only and says so in the panel.
 
 ## Extensions
 

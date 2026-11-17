@@ -45,13 +45,20 @@ fn save_config(app: tauri::AppHandle, cfg: config::AppConfig) -> Result<(), Stri
 /// `pricing.json` next to `config.json` is (re)loaded on every call, not
 /// cached, so editing it takes effect on the next refresh without an app
 /// restart - the file is small and this runs off the main thread anyway.
+///
+/// `usage-ledger.json` in the same folder is Orbitbar's own history of the
+/// claude and pi daily totals (see `usage::ledger`); it is the only file this
+/// writes, never one of the agents' files.
 #[tauri::command]
 async fn get_usage(app: tauri::AppHandle, window: usage::TimeWindow) -> Result<usage::UsageSnapshot, String> {
-    let pricing_path = config::config_dir(&app)?.join("pricing.json");
+    let config_dir = config::config_dir(&app)?;
+    let pricing_path = config_dir.join("pricing.json");
+    let ledger_path = config_dir.join(usage::ledger::FILE_NAME);
     tauri::async_runtime::spawn_blocking(move || {
         let paths = usage::resolve_paths(None).ok_or_else(|| "cannot resolve home directory".to_string())?;
         let (overrides, pricing_warning) = usage::pricing::load_overrides(&pricing_path);
-        let mut snapshot = usage::collect_usage(window, &paths, chrono::Local::now(), &overrides);
+        let mut snapshot =
+            usage::collect_usage(window, &paths, chrono::Local::now(), &overrides, Some(&ledger_path));
         snapshot.pricing_warning = pricing_warning;
         Ok(snapshot)
     })

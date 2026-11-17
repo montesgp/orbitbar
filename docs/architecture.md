@@ -24,9 +24,11 @@ flowchart LR
     CFG["config.rs<br/>schema, load/save, themes"]
     USAGE["usage/mod.rs<br/>collect_usage, TimeWindow"]
     PRICE["usage/pricing.rs<br/>built-in table + pricing.json"]
+    LEDGER["usage/ledger.rs<br/>usage-ledger.json, claude + pi daily buckets"]
     CMD --> CFG
     CMD --> USAGE
     USAGE --> PRICE
+    USAGE -->|"read + write (own file)"| LEDGER
   end
   subgraph READERS["Per-agent readers — app/src-tauri/src/usage"]
     direction TB
@@ -57,7 +59,9 @@ flowchart LR
 ```
 
 Every read is a local file, and the frontend talks to the Rust core only
-through Tauri's `invoke()` IPC.
+through Tauri's `invoke()` IPC. The agents' files are only read; the one
+file the usage code writes is Orbitbar's own `usage-ledger.json` in its
+config directory.
 
 ## Layers
 
@@ -73,6 +77,7 @@ through Tauri's `invoke()` IPC.
 | Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
 | Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket on its own |
+| Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
 ## Interaction model
@@ -117,7 +122,8 @@ through Tauri's `invoke()` IPC.
    `last365Days`, today plus the previous 364 days),
    starting with `today`.
 2. `get_usage` (in `lib.rs`) resolves the four store paths under the
-   user's home directory, loads `pricing.json` if present, and runs the
+   user's home directory, loads `pricing.json` if present, passes the path
+   of `usage-ledger.json` in the same config directory, and runs the
    whole read off the main thread (`spawn_blocking`) so a large history
    never stalls the window.
 3. `usage::collect_usage` calls each reader, in the order the snapshot
@@ -140,7 +146,21 @@ through Tauri's `invoke()` IPC.
    window's dates: each bucket is priced with its own model and the amounts
    summed, so a total's cost is missing only when no bucket in it has a
    price.
-5. The `UsageSnapshot` — window bounds, per-agent totals, per-project
+5. Before folding, the claude and pi buckets are merged with the ledger
+   (`usage::ledger::Session`, which holds a process-wide lock from the load
+   to the write). Per `(agent, date, project)` the bucket with more entries
+   wins, the agent's files on a tie, and a day only the ledger has still
+   counts, so a transcript Claude Code deleted after `cleanupPeriodDays`
+   stays in the history. Claude is merged first and its merged buckets go
+   to pi, so the `claude-bridge` check also sees the days only the ledger
+   has. Records older than 365 days are pruned, and the file is written
+   (temp file plus rename) only when this call changed it. The ledger holds
+   raw counters and the model, never a cost. A file that cannot be read,
+   does not parse or has an unknown version is left untouched: that call
+   uses the agents' files only and the claude and pi `detail` say why; a
+   failed write is reported the same way and never fails `get_usage`.
+   Codex and OpenCode are not stored: their stores keep their history.
+6. The `UsageSnapshot` — window bounds, per-agent totals, per-project
    breakdown, an optional `pricingWarning` — serializes back to the
    frontend, where `usage-view.ts` turns it into the rendered panel.
 
@@ -202,6 +222,8 @@ beyond wiring the new item's `action` to the new `invoke()` call.
   then persists `autoStart`.
 - The webview is WebView2 on Windows, WKWebView on macOS and WebKitGTK 4.1 on
   Linux.
+- `usage-ledger.json` lives next to `config.json` (see the data flow above);
+  `std::fs::rename` replaces the old file in one step on every OS.
 - `pricing.json` lives next to `config.json` and is reloaded on every
   `get_usage` call. The "Open pricing file" menu entry creates it from a
   template if it is missing and opens it with the opener plugin, which the
@@ -223,5 +245,6 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src-tauri/src/usage/codex.rs` | Codex CLI JSONL reader |
 | `app/src-tauri/src/usage/opencode.rs` | OpenCode SQLite reader |
 | `app/src-tauri/src/usage/pi.rs` | Pi JSONL reader, with the `claude-bridge` check against Claude's buckets |
+| `app/src-tauri/src/usage/ledger.rs` | Orbitbar's own usage ledger: load, merge, prune, atomic write |
 | `app/src-tauri/src/usage/pricing.rs` | Built-in price table, `pricing.json` override loading, cost estimation |
 | `extensions/` | Optional Herdr and OmniRoute integrations, see [extensions/README.md](../extensions/README.md) |

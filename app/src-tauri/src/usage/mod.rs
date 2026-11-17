@@ -11,6 +11,7 @@
 pub mod claude;
 pub mod codex;
 pub mod daily;
+pub mod ledger;
 pub mod opencode;
 pub mod pi;
 pub mod pricing;
@@ -529,7 +530,13 @@ pub struct UsageSnapshot {
 /// opencode, pi, pricing claude/codex/pi against `overrides` layered on top
 /// of the built-in table (see `pricing::find_price_entry`). Pi reads after
 /// claude because its claude-bridge turns count only where Claude's daily
-/// buckets have no `(date, project)`. Sequential: bounded, independent reads
+/// buckets have no `(date, project)`.
+///
+/// With a `ledger_path`, the claude and pi daily buckets are merged with
+/// Orbitbar's own ledger (see `usage::ledger`) before the window is folded,
+/// so a day an agent has since deleted still counts, and the ledger is
+/// written back when that changed it. `None` reads the agents' files only and
+/// writes nothing (tests, the parity harness). Sequential: bounded, independent reads
 /// are cheaper than the coordination a parallel version would need, and a
 /// broken one never blocks the others because each is wrapped in its own
 /// `AgentUsageReport`.
@@ -538,20 +545,47 @@ pub fn collect_usage(
     paths: &UsagePaths,
     now: DateTime<Local>,
     overrides: &pricing::PriceOverrides,
+    ledger_path: Option<&Path>,
 ) -> UsageSnapshot {
     let (start, end) = window_range(window, now);
+    let (first_day, end_day) = (start.date_naive(), end.date_naive());
     let mut root_cache = ProjectRootCache::new();
 
-    // Claude's buckets stay around for pi, whose claude-bridge turns count
-    // only where Claude has no bucket of its own.
     let claude_daily = claude::read_daily(&paths.claude_dir, &mut root_cache);
-    let (claude, claude_buckets) = match claude_daily {
-        Ok(daily) => (claude::report(&daily, start.date_naive(), end.date_naive(), overrides), daily.buckets),
-        Err(report) => (*report, daily::DailyBuckets::default()),
-    };
     let codex = codex::read_usage(&paths.codex_dir, start, end, overrides, &mut root_cache);
     let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache);
-    let pi = pi::read_usage(&paths.pi_dir, &claude_buckets, start, end, overrides, &mut root_cache);
+
+    // The ledger is locked from here until it is written, so the claude and
+    // pi merges of concurrent calls never interleave.
+    let mut ledger = ledger_path.map(ledger::Session::open);
+
+    // Claude's merged buckets stay around for pi, whose claude-bridge turns
+    // count only where Claude (its files or the ledger) has no bucket.
+    let (mut claude, claude_buckets) = match claude_daily {
+        Ok(mut daily) => {
+            if let Some(ledger) = ledger.as_mut() {
+                daily.buckets = ledger.merge(claude::AGENT, &daily.buckets);
+            }
+            (claude::report(&daily, first_day, end_day, overrides), daily.buckets)
+        }
+        Err(report) => (*report, ledger.as_ref().map(|l| l.stored(claude::AGENT)).unwrap_or_default()),
+    };
+    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &mut root_cache) {
+        Ok(mut daily) => {
+            if let Some(ledger) = ledger.as_mut() {
+                daily.buckets = ledger.merge(pi::AGENT, &daily.buckets);
+            }
+            pi::report(&daily, first_day, end_day, overrides)
+        }
+        Err(report) => *report,
+    };
+
+    if let Some(note) = ledger.and_then(|l| l.finish(now.date_naive())) {
+        for report in [&mut claude, &mut pi] {
+            report.detail.push_str(" - ");
+            report.detail.push_str(&note);
+        }
+    }
 
     UsageSnapshot {
         window,
@@ -566,7 +600,7 @@ pub fn collect_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{NaiveDate, TimeZone};
     use tempfile::tempdir;
 
     fn local(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
@@ -690,7 +724,7 @@ mod tests {
     fn collect_usage_reports_claude_codex_opencode_then_pi() {
         let dir = tempdir().unwrap();
         let paths = resolve_paths(Some(dir.path())).unwrap();
-        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default());
+        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None);
 
         let agents: Vec<&str> = snapshot.agents.iter().map(|a| a.agent.as_str()).collect();
         assert_eq!(agents, vec!["claude", "codex", "opencode", "pi"]);
@@ -734,7 +768,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default());
+        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None);
         let claude = &snapshot.agents[0];
         let pi = &snapshot.agents[3];
         assert_eq!(claude.totals.output_tokens, 10);
@@ -742,6 +776,271 @@ mod tests {
         assert_eq!(pi.totals.entries, 1);
         assert_eq!(pi.totals.output_tokens, 7);
         assert!(pi.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", pi.detail);
+    }
+
+    /// A home for the ledger tests: claude and pi files with no cwd (the
+    /// no-project bucket, so nothing depends on the real temp or home
+    /// directory), and a ledger in a config folder of its own.
+    struct LedgerHome {
+        dir: tempfile::TempDir,
+        paths: UsagePaths,
+    }
+
+    impl LedgerHome {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let paths = resolve_paths(Some(dir.path())).unwrap();
+            std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
+            std::fs::create_dir_all(paths.pi_dir.join("p")).unwrap();
+            Self { dir, paths }
+        }
+
+        fn ledger(&self) -> PathBuf {
+            self.dir.path().join("config").join(ledger::FILE_NAME)
+        }
+
+        /// Writes a claude transcript of `(id, day, output)` entries.
+        fn claude(&self, name: &str, entries: &[(&str, u32, u64)]) -> PathBuf {
+            let path = self.paths.claude_dir.join("p").join(name);
+            let mut content = String::new();
+            for (id, day, output) in entries {
+                content.push_str(&format!(
+                    r#"{{"requestId":"{id}","timestamp":"{}","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{output},"cache_read_input_tokens":2,"cache_creation":{{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}}}}}}}}"#,
+                    ts(*day)
+                ));
+                content.push('\n');
+            }
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        /// Writes a pi session of `(id, day, provider, output)` turns.
+        fn pi(&self, name: &str, turns: &[(&str, u32, &str, u64)]) {
+            let mut content = r#"{"type":"session","id":"s","cwd":""}"#.to_string() + "\n";
+            for (id, day, provider, output) in turns {
+                content.push_str(&format!(
+                    r#"{{"type":"message","id":"{id}","timestamp":"{}","message":{{"role":"assistant","provider":"{provider}","model":"gpt-5.5","usage":{{"input":1,"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":0}}}}}}"#,
+                    ts(*day)
+                ));
+                content.push('\n');
+            }
+            std::fs::write(self.paths.pi_dir.join("p").join(name), content).unwrap();
+        }
+
+        fn collect(&self, ledger: Option<&Path>) -> UsageSnapshot {
+            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger)
+        }
+    }
+
+    fn ledger_now() -> DateTime<Local> {
+        local(2026, 9, 15, 18, 0)
+    }
+
+    /// Noon local time on `day` of September 2026, as the UTC the stores write.
+    fn ts(day: u32) -> String {
+        local(2026, 9, day, 12, 0).to_utc().to_rfc3339()
+    }
+
+    /// A ledger file holding one no-project claude record per `(date, entries, output)`.
+    fn ledger_file(records: &[(&str, u64, u64)]) -> String {
+        let days: Vec<serde_json::Value> = records
+            .iter()
+            .map(|(date, entries, output)| {
+                serde_json::json!({
+                    "agent": "claude", "date": date, "project": "", "model": "claude-opus-5-5",
+                    "input": 0, "output": output, "cacheRead": 0, "cacheWrite5m": 0, "cacheWrite1h": 0,
+                    "reasoning": 0, "entries": entries
+                })
+            })
+            .collect();
+        serde_json::json!({ "version": 1, "days": days }).to_string()
+    }
+
+    /// Claude Code deletes old transcripts; a day the ledger saw still counts.
+    #[test]
+    fn a_deleted_claude_transcript_still_counts_through_the_ledger() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        let transcript = home.claude("s.jsonl", &[("r1", 14, 10), ("r2", 15, 20)]);
+
+        let first = home.collect(Some(&ledger));
+        assert!(ledger.exists(), "the first collect creates the ledger");
+        std::fs::remove_file(&transcript).unwrap();
+        let second = home.collect(Some(&ledger));
+
+        let (before, after) = (&first.agents[0], &second.agents[0]);
+        assert_eq!(after.status, AgentStatus::Ok);
+        assert_eq!(after.totals.entries, 2);
+        assert_eq!(after.totals.output_tokens, 30);
+        assert_eq!(after.totals, before.totals, "every counter and the cost come back from the ledger");
+        assert!(after.totals.cost.is_some());
+
+        let without_ledger = home.collect(None);
+        assert_eq!(without_ledger.agents[0].totals.entries, 0, "the agent's own files no longer have it");
+    }
+
+    /// The ledger is written only when a collect changed it: an equal
+    /// ledger, even formatted differently, keeps its bytes.
+    #[test]
+    fn an_unchanged_ledger_is_not_rewritten() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        home.collect(Some(&ledger));
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let compact = serde_json::to_string(&value).unwrap();
+        std::fs::write(&ledger, &compact).unwrap();
+        home.collect(Some(&ledger));
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), compact, "nothing changed, nothing written");
+
+        home.claude("s.jsonl", &[("r1", 14, 10), ("r2", 15, 20)]);
+        home.collect(Some(&ledger));
+        let reread = ledger::load(&ledger).unwrap();
+        assert_eq!(reread.buckets("claude").iter().count(), 2, "a new day is written");
+    }
+
+    /// A ledger Orbitbar cannot use is never overwritten: the call reads the
+    /// agents' files only and the claude and pi details say why.
+    #[test]
+    fn a_corrupt_or_unknown_version_ledger_is_left_untouched() {
+        for (content, reason) in [
+            ("{ not json".to_string(), "not a valid ledger"),
+            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":2"#), "unknown version 2"),
+        ] {
+            let home = LedgerHome::new();
+            let ledger = home.ledger();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, &content).unwrap();
+            home.claude("s.jsonl", &[("r1", 14, 10)]);
+            home.pi("s.jsonl", &[("c1", 14, "openai-codex", 7)]);
+
+            let snapshot = home.collect(Some(&ledger));
+            assert_eq!(std::fs::read_to_string(&ledger).unwrap(), content, "{reason}: left byte for byte");
+            let (claude, pi) = (&snapshot.agents[0], &snapshot.agents[3]);
+            assert_eq!(claude.totals.output_tokens, 10, "{reason}: source data only");
+            assert_eq!(pi.totals.output_tokens, 7);
+            for detail in [&claude.detail, &pi.detail] {
+                assert!(detail.contains("history ledger not used"), "{detail}");
+                assert!(detail.contains(reason), "{detail}");
+            }
+            assert!(!snapshot.agents[1].detail.contains("ledger"), "codex never uses the ledger");
+        }
+    }
+
+    /// A claude-bridge turn on a day only the ledger still has for Claude is
+    /// already counted there, whether the Claude folder is empty or gone.
+    #[test]
+    fn a_bridge_turn_on_a_day_only_the_ledger_has_for_claude_is_skipped() {
+        for claude_dir_exists in [true, false] {
+            let home = LedgerHome::new();
+            if !claude_dir_exists {
+                std::fs::remove_dir_all(&home.paths.claude_dir).unwrap();
+            }
+            let ledger = home.ledger();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, ledger_file(&[("2026-09-15", 1, 10)])).unwrap();
+            home.pi("s.jsonl", &[("b1", 15, "claude-bridge", 10), ("c1", 15, "openai-codex", 7)]);
+
+            let snapshot = home.collect(Some(&ledger));
+            let pi = &snapshot.agents[3];
+            assert_eq!(pi.totals.entries, 1, "claude folder exists: {claude_dir_exists}");
+            assert_eq!(pi.totals.output_tokens, 7);
+            assert!(pi.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", pi.detail);
+            if claude_dir_exists {
+                assert_eq!(snapshot.agents[0].totals.output_tokens, 10, "the ledger day is in Claude's totals");
+            }
+        }
+    }
+
+    /// Two collects at once, each reading a different home into the same
+    /// ledger, leave a valid file holding both.
+    #[test]
+    fn two_collects_at_once_leave_the_union_in_the_ledger() {
+        for _ in 0..5 {
+            let config = tempdir().unwrap();
+            let ledger = config.path().join(ledger::FILE_NAME);
+            let (a, b) = (LedgerHome::new(), LedgerHome::new());
+            a.claude("s.jsonl", &[("r1", 14, 10)]);
+            b.claude("s.jsonl", &[("r2", 15, 20)]);
+
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                for home in [&a, &b] {
+                    let (barrier, ledger) = (&barrier, &ledger);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        home.collect(Some(ledger));
+                    });
+                }
+            });
+
+            let stored = ledger::load(&ledger).expect("a valid ledger");
+            let days: Vec<NaiveDate> = stored.buckets("claude").iter().map(|(d, _, _)| d).collect();
+            assert_eq!(days, vec![local(2026, 9, 14, 0, 0).date_naive(), local(2026, 9, 15, 0, 0).date_naive()]);
+            let empty = LedgerHome::new();
+            assert_eq!(empty.collect(Some(&ledger)).agents[0].totals.output_tokens, 30);
+        }
+    }
+
+    /// A ledger that cannot be written never fails the collect.
+    #[test]
+    fn a_ledger_that_cannot_be_saved_is_reported_in_the_detail() {
+        let home = LedgerHome::new();
+        let not_a_dir = home.dir.path().join("config-file");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        home.pi("s.jsonl", &[("c1", 14, "openai-codex", 7)]);
+
+        let snapshot = home.collect(Some(&not_a_dir.join(ledger::FILE_NAME)));
+        let (claude, pi) = (&snapshot.agents[0], &snapshot.agents[3]);
+        assert_eq!(claude.totals.output_tokens, 10);
+        assert!(claude.detail.contains("history ledger not saved"), "{}", claude.detail);
+        assert!(pi.detail.contains("history ledger not saved"), "{}", pi.detail);
+        assert_eq!(std::fs::read_to_string(&not_a_dir).unwrap(), "x");
+    }
+
+    /// Records older than the 365 days that end today leave the file.
+    #[test]
+    fn a_collect_prunes_records_older_than_365_days() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let today = ledger_now().date_naive();
+        let kept = (today - Duration::days(364)).to_string();
+        let old = (today - Duration::days(365)).to_string();
+        std::fs::write(&ledger, ledger_file(&[(&kept, 1, 1), (&old, 1, 2)])).unwrap();
+
+        home.collect(Some(&ledger));
+        let days: Vec<String> =
+            ledger::load(&ledger).unwrap().buckets("claude").iter().map(|(d, _, _)| d.to_string()).collect();
+        assert_eq!(days, vec![kept]);
+    }
+
+    /// Without a ledger path the collect only reads: the parity harness
+    /// relies on it.
+    #[test]
+    fn a_collect_without_a_ledger_path_writes_nothing() {
+        let home = LedgerHome::new();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        let before = list_files(home.dir.path());
+        home.collect(None);
+        assert_eq!(list_files(home.dir.path()), before);
+    }
+
+    fn list_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                }
+                out.push(entry.path());
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
@@ -1021,7 +1320,8 @@ mod tests {
 
     /// Not a unit test: prints the real home directory's ThisMonth snapshot
     /// so it can be sanity-checked by hand against what the agents' own UIs
-    /// report. `--ignored` because it depends on this machine's real
+    /// report. It passes no ledger path, so it never writes a file.
+    /// `--ignored` because it depends on this machine's real
     /// `.claude` / `.codex` / opencode / `.pi` stores, which do not exist in CI or on
     /// a fresh checkout.
     ///
@@ -1031,7 +1331,7 @@ mod tests {
     fn parity_this_month_against_the_real_home() {
         let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
         let overrides = pricing::PriceOverrides::default();
-        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides);
+        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None);
 
         println!("\n=== orbitbar Rust reader parity (ThisMonth) ===");
         for agent in &snapshot.agents {
