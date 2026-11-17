@@ -423,7 +423,15 @@ fn resolve_project_root_uncached(cwd: &str, policy: &RootPolicy) -> Option<Strin
     // From here the walk runs on resolved paths: the surviving directory
     // through junctions and symlinks, and the temp and home boundaries in
     // their resolved form too, so a link never slips past either.
-    let start = PathBuf::from(normalize_project_path(&resolved_dir(start).to_string_lossy()));
+    let resolved_start = PathBuf::from(normalize_project_path(&resolved_dir(start).to_string_lossy()));
+    // The missing part is rebuilt on top of the resolved ancestor, so a
+    // deleted repo reached through a link keeps the key it had while it
+    // existed (the ledger stores days under that key).
+    let top_missing = top_missing.map(|missing| match missing.strip_prefix(start) {
+        Ok(suffix) => resolved_start.join(suffix),
+        Err(_) => missing.to_path_buf(),
+    });
+    let start = resolved_start;
     if top_missing.is_none() {
         let resolved_cwd = start.to_string_lossy();
         if policy.temp_dirs.iter().any(|temp| is_within(&resolved_cwd, &resolved_dir(temp))) {
@@ -1159,6 +1167,29 @@ mod tests {
         assert_eq!(direct, canonical_key(&repo));
         assert_eq!(through_link, direct);
         assert_eq!(link_root, direct);
+    }
+
+    /// A repository reached through a link keeps its key after it is deleted,
+    /// so the ledger's stored days and the transcripts' days stay one project
+    /// instead of two rows counting the same usage.
+    #[test]
+    fn a_deleted_repository_reached_through_a_link_keeps_its_resolved_key() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        let repo = real.join("proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let link = dir.path().join("link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+        let cwd = link.join("proj").join("app");
+        let before = resolve(&cwd, policy(dir.path(), &[]));
+        assert_eq!(before, canonical_key(&repo));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert_eq!(resolve(&cwd, policy(dir.path(), &[])), before);
     }
 
     /// A folder outside any repository stays excluded when it is reached
