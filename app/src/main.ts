@@ -10,6 +10,7 @@ import {
   barFromWindow,
   barMoved,
   collapsedTabDyCss,
+  cssToPhysical,
   physicalToCss,
   requestKey,
   type Rect,
@@ -20,6 +21,7 @@ import {
   agentFromAction,
   buildPanelViewModel,
   isUsageAction,
+  projectToggleLabel,
   WINDOW_OPTIONS,
   type AgentSectionViewModel,
   type TimeWindow,
@@ -81,10 +83,13 @@ export interface ConfigPayload {
 }
 
 /**
- * Physical window sizes, ported 1:1 from the measured WPF v1 window. The bar is
- * a 72x400 crescent; the collapsed state is a 46x46 tab. These MUST match the
- * constants in src-tauri/src/lib.rs, which sizes the window before the webview
- * paints — a mismatch shows up as a clipped crescent, not a layout bug.
+ * Bar sizes in CSS pixels, ported 1:1 from the measured WPF v1 window. The bar
+ * is a 72x400 crescent; the collapsed state is a 46x46 tab. These MUST match
+ * the constants in src-tauri/src/lib.rs, which sizes the window before the
+ * webview paints — a mismatch shows up as a clipped crescent, not a layout bug.
+ * Every size here (bar, panel, menu) is CSS pixels and goes through
+ * `cssToPhysical` before it reaches Rust, which works in physical pixels: on a
+ * scale-2 Retina screen the window must be 144x800 for a 72x400 bar.
  */
 const SIZE_COLLAPSED: Size = { width: 46, height: 46 };
 const SIZE_EXPANDED: Size = { width: 72, height: 400 };
@@ -264,7 +269,7 @@ let placementQueue: Promise<unknown> = Promise.resolve();
 async function initPlacement(cfg: OrbitbarConfig): Promise<void> {
   const pos = await win.outerPosition();
   scaleFactor = await win.scaleFactor();
-  const rect = { x: pos.x, y: pos.y, ...barSizeFor(cfg.collapsed) };
+  const rect = { x: pos.x, y: pos.y, ...cssToPhysical(barSizeFor(cfg.collapsed), scaleFactor) };
   placement = { bar: rect, window: rect, side: "left", barOffset: { x: 0, y: 0 }, monitor: null };
   placementKey = null;
 }
@@ -276,8 +281,7 @@ function setBarDy(cssPx: number): void {
 }
 
 /** Draws the menu/panel on the side Rust chose. The bar offset arrives in
- * physical pixels and is converted for CSS. The bar's own 72x400 geometry
- * stays a fixed physical-equals-CSS assumption, as it always was. */
+ * physical pixels and is converted for CSS. */
 function applyLayout(p: Placement): void {
   document.body.classList.toggle("side-right", p.side === "right");
   setBarDy(physicalToCss(p.barOffset.y, scaleFactor));
@@ -339,10 +343,10 @@ function applyAndRemember(
 async function placeNow(cfg: OrbitbarConfig, panelOpen: boolean, menuOpen: boolean): Promise<Placement> {
   const last = placement;
   if (!last) throw new Error("placement not initialised");
-  const size = barSizeFor(cfg.collapsed);
-  const extra = extraFor(cfg.collapsed, panelOpen, menuOpen);
   const pos = await win.outerPosition();
   scaleFactor = await win.scaleFactor();
+  const size = cssToPhysical(barSizeFor(cfg.collapsed), scaleFactor);
+  const extra = cssToPhysical(extraFor(cfg.collapsed, panelOpen, menuOpen), scaleFactor);
   const bar = barFromWindow(pos, last);
   // Re-placing the geometry the window already has still makes the OS repaint
   // it, so an unchanged request is skipped.
@@ -644,7 +648,7 @@ function setPanelUi(open: boolean): void {
 /**
  * Token-usage panel: renders `get_usage(window)` for either every agent
  * (`agent-usage`) or one agent (`agent-usage:<agent>`): status, totals,
- * cost, then up to 5 top projects. There is no refresh timer — the panel
+ * cost, then the top 5 projects, expandable to every project. There is no refresh timer — the panel
  * fetches on open and on window change only, never background polling.
  */
 
@@ -657,14 +661,18 @@ let usageWindow: TimeWindow = "today";
 /** Guards against a stale response winning a race when the panel is
  * reopened, or the window changed, before the previous fetch resolved. */
 let usageFetchToken = 0;
+/** Agents whose project list is expanded past the top 5. Session-only like
+ * the window: cleared whenever the panel opens from closed. */
+const usageExpandedAgents = new Set<string>();
 
 function usageStatusBadge(status: AgentSectionViewModel["status"]): string {
   if (status.state === "ok") return "";
   return status.state === "notInstalled" ? " (not installed)" : " (error)";
 }
 
-/** One agent's block: name/status, totals, cost, then its top projects. */
-function renderUsageSection(section: AgentSectionViewModel): HTMLElement {
+/** One agent's block: name/status, totals, cost, then its top projects.
+ * `onToggleProjects` expands or collapses this agent's project list. */
+function renderUsageSection(section: AgentSectionViewModel, onToggleProjects: () => void): HTMLElement {
   const el = document.createElement("div");
   el.className = "usage-section";
 
@@ -729,6 +737,17 @@ function renderUsageSection(section: AgentSectionViewModel): HTMLElement {
     el.appendChild(projects);
   }
 
+  const toggleLabel = projectToggleLabel(section);
+  if (toggleLabel) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "usage-projects-toggle";
+    toggle.textContent = toggleLabel;
+    toggle.setAttribute("aria-expanded", String(section.expanded));
+    toggle.addEventListener("click", onToggleProjects);
+    el.appendChild(toggle);
+  }
+
   return el;
 }
 
@@ -781,9 +800,12 @@ function renderUsageResult(
   snapshot: UsageSnapshot,
   filterAgent: string | null,
 ): void {
+  // Keep the scroll position across an expand/collapse re-render.
+  const scroller = body.closest<HTMLElement>(".panel");
+  const scrollTop = scroller?.scrollTop ?? 0;
   body.replaceChildren();
   body.appendChild(renderWindowSelector(onWindowChange));
-  const vm = buildPanelViewModel(snapshot, filterAgent);
+  const vm = buildPanelViewModel(snapshot, filterAgent, usageExpandedAgents);
   if (vm.sections.length === 0) {
     const empty = document.createElement("div");
     empty.className = "usage-line usage-line--dim";
@@ -792,8 +814,14 @@ function renderUsageResult(
     return;
   }
   for (const section of vm.sections) {
-    body.appendChild(renderUsageSection(section));
+    const onToggleProjects = (): void => {
+      if (usageExpandedAgents.has(section.agent)) usageExpandedAgents.delete(section.agent);
+      else usageExpandedAgents.add(section.agent);
+      renderUsageResult(body, onWindowChange, snapshot, filterAgent);
+    };
+    body.appendChild(renderUsageSection(section, onToggleProjects));
   }
+  if (scroller) scroller.scrollTop = scrollTop;
 }
 
 /**
@@ -1088,7 +1116,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         // The tab ends up centered on the bar's center (Rust keeps that
         // point), so paint it there in the window that is still tall.
         if (placement) {
-          setBarDy(collapsedTabDyCss(placement.window.height, SIZE_COLLAPSED.height, scaleFactor));
+          const tab = cssToPhysical(SIZE_COLLAPSED, scaleFactor);
+          setBarDy(collapsedTabDyCss(placement.window.height, tab.height, scaleFactor));
         }
         setCollapsedUi(true);
         // Collapsing re-anchors the bar, so its position changed.
@@ -1308,7 +1337,10 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (isUsageAction(action)) {
           // Opening from closed starts on Today; switching agent while the
           // panel is already open keeps the user's current selection.
-          if (!panelOpen) usageWindow = "today";
+          if (!panelOpen) {
+            usageWindow = "today";
+            usageExpandedAgents.clear();
+          }
           activePanelAction = action;
           await openUsagePanel(action, body, togglePanel);
           return;

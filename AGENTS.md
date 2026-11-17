@@ -104,7 +104,9 @@ DOM code so it stays unit-testable.
   at the exact executable path that registered it.
 - **Orbitbar only reads agent data.** The files in
   [README.md § Data sources](README.md#data-sources) are opened read-only.
-  Do not add writes to them or any network calls.
+  Do not add writes to them or any network calls. The one file the usage
+  code writes is Orbitbar's own `usage-ledger.json` in its config directory
+  (see [docs/architecture.md](docs/architecture.md)).
 - **Version bumps touch four files**, kept equal; see
   [CONTRIBUTING.md § Release process](CONTRIBUTING.md#release-process).
   Releases run only when a `vX.Y.Z` tag is pushed.

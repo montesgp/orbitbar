@@ -4,7 +4,7 @@
 
 Orbitbar is a small bar that stays where you put it on your screen, always
 visible above your other windows. It shows the token usage and cost of your local AI
-coding agents (Claude Code, Codex and OpenCode): overall, per project, and
+coding agents (Claude Code, Codex, OpenCode and Pi): overall, per project, and
 for the time window you pick. It runs on Windows, macOS and Linux.
 
 | Dark | Light |
@@ -18,10 +18,13 @@ for the time window you pick. It runs on Windows, macOS and Linux.
   collapses to a small tab, and opens a usage panel and a menu beside it, on
   whichever side has room. Only one Orbitbar runs at a time.
 - **Usage per agent and per project.** Output tokens and cost for Today,
-  the last 7 days, the last 30 days or the current month.
+  the last 7 days, the last 30 days, the current month or the last 365 days.
 - **Local data only.** Orbitbar reads the session history your agents
   already keep on disk. It needs no account, sends no telemetry and makes no
   network calls.
+- **A year of history.** Orbitbar keeps its own daily totals for Claude Code
+  and Pi, so usage stays visible after an agent deletes old sessions. See
+  [History](#history).
 - **Sourced prices.** A built-in price table with a per-user override file.
   A model without a price entry shows `no price data`.
 - **Light and dark themes**, switched live from the bar's menu.
@@ -130,7 +133,7 @@ its own formats; build on the OS you are targeting. See
 ## Using Orbitbar
 
 - **Click an agent cell** to open its usage panel. The panel always opens on
-  Today; its selector switches to 7 days, 30 days or this month while the
+  Today; its selector switches to 7 days, 30 days, this month or 365 days while the
   panel is open. Click the same cell again, press Escape, or use the close
   button to close it.
 - **Right-click the bar** (or the collapsed tab), or **left-click the
@@ -184,8 +187,8 @@ Item actions:
 
 | Action | What it does |
 | --- | --- |
-| `agent-usage` | Opens the usage panel with all three agents. |
-| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode` | Opens the panel for one agent. |
+| `agent-usage` | Opens the usage panel with every agent. |
+| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode`, `agent-usage:pi` | Opens the panel for one agent. Pi has no cell of its own by default. |
 | `toggle-autostart` | Turns autostart on or off and updates the OS entry. |
 | `edit-config` | Opens the bar's menu at the click; "Edit config" there opens `config.json` in your default editor. |
 | `open:<url>` | Opens an `http://` or `https://` URL in your default browser. Other schemes are rejected and the panel shows why. |
@@ -260,9 +263,15 @@ with a warning.
 | Claude Code | `~/.claude/projects/**/*.jsonl` | Read-only |
 | Codex | `~/.codex/sessions/**/*.jsonl` | Read-only |
 | OpenCode | `~/.local/share/opencode/opencode.db` | Read-only SQLite |
+| Pi | `~/.pi/agent/sessions/**/*.jsonl` | Read-only |
 
 `~` is your home directory on every OS. See
 [docs/architecture.md](docs/architecture.md) for how the readers work.
+
+Pi turns run through its `claude-bridge` provider are Claude Code sessions,
+so Claude Code's own files hold them too. Pi counts them only for a day and
+project that Claude has no usage for, and its panel says how many it left
+out; turns from every other Pi provider always count.
 
 Usage is grouped by project: the repository a session ran in. Runs that are
 not part of a project are not counted, neither in the project list nor in the
@@ -270,7 +279,26 @@ agent totals: sessions started in your operating system's temporary folder
 (for example a tool that spawns short-lived agent runs there), and sessions
 started in a folder that is not inside any Git repository (such as your home
 folder). A project whose folder was renamed or deleted still appears, as one
-row named after the folder that is gone.
+row named after the folder that is gone. A repository reached through two
+paths (for example through a Windows junction or a symbolic link) is one
+project, named by the path the link points to.
+
+Each agent lists its 5 busiest projects by output tokens; **Show all N
+projects** under the list expands it to every project in the window.
+
+### History
+
+Claude Code deletes session files older than its `cleanupPeriodDays` setting
+(30 days unless you change it in `~/.claude/settings.json`), so their usage
+would drop out of the panel. Orbitbar keeps daily totals per project for
+Claude Code and Pi in `usage-ledger.json`, next to `config.json`, and keeps
+them for 365 days. It holds token counts and the model only; costs are
+computed when the panel opens, so `pricing.json` still applies. Codex and
+OpenCode keep their whole history in their own stores, so they are not in it.
+
+`usage-ledger.json` is the only file Orbitbar writes for usage; the agents'
+files above are only read. If the ledger cannot be read, Orbitbar leaves it
+as it is, shows the agents' own data only and says so in the panel.
 
 ## Extensions
 

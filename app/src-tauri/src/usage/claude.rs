@@ -1,5 +1,5 @@
 //! Claude usage reader: every `*.jsonl` under `~/.claude/projects`, de-duped
-//! and windowed.
+//! and aggregated into daily buckets.
 //!
 //! Subagent files are billed too, so every file counts, not just the newest
 //! one. The store keeps more than one copy of many assistant messages
@@ -7,46 +7,43 @@
 //! `requestId`, falling back to `message.id` and then `uuid` - summing raw
 //! doubles every counter.
 //!
-//! The window is applied consistently to both the totals and the
-//! per-project breakdown: an entry outside the window never contributes to
-//! either, so the per-project split always matches what the totals claim for
-//! the same window. Sessions outside any project (a cwd under the OS temp dir, or an existing
+//! Every entry carries its own timestamp, so [`read_daily`] sorts it into a
+//! `(local date, project key)` bucket (see `usage::daily`) and [`report`]
+//! folds the window's dates. The totals and the per-project breakdown come
+//! from the same buckets, so the per-project split always matches what the
+//! totals claim for the same window. Sessions outside any project (a cwd under the OS temp dir, or an existing
 //! folder that is not inside a repository; see `resolve_project_root`) are
 //! left out of the totals and the project rows alike, so that invariant holds.
 
+use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_display_name, resolve_project_root,
-    AgentUsageReport, CostBasis, ProjectRootCache, ProjectUsage, UsageTotals,
+    find_jsonl_files, normalize_project_path, pricing, resolve_project_root, AgentUsageReport, CostBasis,
+    ProjectRootCache, UsageTotals,
 };
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const AGENT: &str = "claude";
+pub const AGENT: &str = "claude";
 
-struct Bucket {
-    totals: UsageTotals,
-    model: String,
-    /// Cache-write tokens split by TTL bucket, tracked separately from
-    /// `totals.cache_write_tokens` (their sum, used for display) because
-    /// Anthropic prices a 5-minute cache write differently from a 1-hour one.
-    cache_write_5m: u64,
-    cache_write_1h: u64,
-}
-
-impl Bucket {
-    fn new() -> Self {
-        Self { totals: UsageTotals::default(), model: String::new(), cache_write_5m: 0, cache_write_1h: 0 }
-    }
+/// Everything one scan of the store found, before any window is applied.
+#[derive(Debug, Clone, Default)]
+pub struct ClaudeDaily {
+    /// Every entry, by local date and resolved project root (`""`: no cwd).
+    pub buckets: DailyBuckets,
+    pub files_scanned: u64,
+    /// Entries whose cwd is excluded (see `resolve_project_root`), per local
+    /// date. They are in no bucket, so neither the totals nor the rows count them.
+    pub excluded: BTreeMap<NaiveDate, u64>,
 }
 
 /// Reads month/window usage from every claude session file under `root`,
-/// pricing against `overrides` layered on top of the built-in table.
-/// Per-project totals are keyed by resolved project root (see
-/// `resolve_project_root`), not the raw session cwd, so two cwds inside the
-/// same repository merge into one row.
+/// pricing against `overrides` layered on top of the built-in table: a
+/// [`read_daily`] scan folded over the local dates in `[start, end)`.
+/// `collect_usage` calls the two steps itself to hand Claude's buckets to pi.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_usage(
     root: &Path,
     start: DateTime<Local>,
@@ -54,26 +51,31 @@ pub fn read_usage(
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
+    match read_daily(root, root_cache) {
+        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides),
+        Err(report) => *report,
+    }
+}
+
+/// Scans every session file under `root` into daily buckets. Per-project
+/// buckets are keyed by resolved project root (see `resolve_project_root`),
+/// not the raw session cwd, so two cwds inside the same repository share a
+/// bucket. `Err` carries the finished report when there is nothing to fold:
+/// the store is missing, or no session file could be read.
+pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<ClaudeDaily, Box<AgentUsageReport>> {
     if !root.exists() {
-        return AgentUsageReport::not_installed(AGENT, format!("missing directory: {}", root.display()));
+        return Err(Box::new(AgentUsageReport::not_installed(
+            AGENT,
+            format!("missing directory: {}", root.display()),
+        )));
     }
 
     let files = find_jsonl_files(root);
-    if files.is_empty() {
-        return AgentUsageReport::ok(AGENT, UsageTotals::default(), Vec::new(), "no session files yet");
-    }
-
-    let mut month = Bucket::new();
-    let mut projects: HashMap<String, Bucket> = HashMap::new();
-    let mut files_scanned = 0u64;
-    // Entries in the window whose cwd is excluded (see `resolve_project_root`).
-    // They are left out of the month totals AND the per-project rows, so the
-    // per-project split still sums to the totals.
-    let mut excluded = 0u64;
+    let mut daily = ClaudeDaily::default();
 
     for file in &files {
         let Ok(handle) = std::fs::File::open(file) else { continue };
-        files_scanned += 1;
+        daily.files_scanned += 1;
         let reader = BufReader::new(handle);
 
         // Dedupe is per file: the same requestId can appear in more than one
@@ -106,15 +108,16 @@ pub fn read_usage(
                 }
             }
 
-            let ts = entry
+            // An entry without a readable timestamp belongs to no day, so no
+            // window can count it.
+            let Some(date) = entry
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local));
-            let in_window = matches!(ts, Some(ts) if ts >= start && ts < end);
-            if !in_window {
+                .map(|dt| dt.with_timezone(&Local).date_naive())
+            else {
                 continue;
-            }
+            };
 
             let cwd = entry.get("cwd").and_then(Value::as_str).unwrap_or("");
             let cwd = normalize_project_path(cwd);
@@ -125,7 +128,7 @@ pub fn read_usage(
                 match resolve_project_root(&cwd, root_cache) {
                     Some(root) => root,
                     None => {
-                        excluded += 1;
+                        *daily.excluded.entry(date).or_default() += 1;
                         continue;
                     }
                 }
@@ -136,96 +139,61 @@ pub fn read_usage(
                 .and_then(|m| m.get("model"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|m| !m.is_empty() && !m.starts_with('<'));
+                .filter(|m| !m.is_empty() && !m.starts_with('<'))
+                .unwrap_or("");
 
-            let input = get_u64(usage, "input_tokens");
-            let output = get_u64(usage, "output_tokens");
-            let cache_read = get_u64(usage, "cache_read_input_tokens");
             let (cache_write_5m, cache_write_1h) = extract_cache_write(usage);
-            let reasoning = usage
-                .get("output_tokens_details")
-                .map(|d| get_u64(d, "thinking_tokens"))
-                .unwrap_or(0);
-
-            add_entry(&mut month, input, output, cache_read, cache_write_5m, cache_write_1h, reasoning, model);
-
-            if !project_key.is_empty() {
-                let bucket = projects.entry(project_key).or_insert_with(Bucket::new);
-                add_entry(bucket, input, output, cache_read, cache_write_5m, cache_write_1h, reasoning, model);
-            }
+            let counters = DailyCounters {
+                input: get_u64(usage, "input_tokens"),
+                output: get_u64(usage, "output_tokens"),
+                cache_read: get_u64(usage, "cache_read_input_tokens"),
+                cache_write_5m,
+                cache_write_1h,
+                reasoning: usage
+                    .get("output_tokens_details")
+                    .map(|d| get_u64(d, "thinking_tokens"))
+                    .unwrap_or(0),
+                entries: 1,
+                model: model.to_string(),
+            };
+            daily.buckets.add(date, &project_key, &counters);
         }
     }
 
-    if files_scanned == 0 {
-        return AgentUsageReport::error(AGENT, format!("no session files readable under {}", root.display()));
+    if !files.is_empty() && daily.files_scanned == 0 {
+        return Err(Box::new(AgentUsageReport::error(
+            AGENT,
+            format!("no session files readable under {}", root.display()),
+        )));
+    }
+    Ok(daily)
+}
+
+/// The window report for the local dates in `[start, end)`. Each bucket is
+/// priced with its own model and the amounts summed (see `DailyBuckets::fold`).
+pub fn report(
+    daily: &ClaudeDaily,
+    start: NaiveDate,
+    end: NaiveDate,
+    overrides: &pricing::PriceOverrides,
+) -> AgentUsageReport {
+    // With no session file left, the ledger may still hold days to fold.
+    if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
+        return AgentUsageReport::ok(AGENT, UsageTotals::default(), Vec::new(), "no session files yet");
     }
 
-    let mut month_totals = month.totals;
-    if month_totals.entries > 0 {
-        let est = pricing::estimate_cost(
-            &month.model,
-            month_totals.input_tokens,
-            month_totals.output_tokens,
-            month_totals.cache_read_tokens,
-            month.cache_write_5m,
-            month.cache_write_1h,
-            overrides,
-        );
-        month_totals.cost = est.amount;
-        month_totals.cost_basis = est.amount.map(|_| CostBasis::ApiEquivalent);
-    }
+    let price = |c: &DailyCounters| {
+        pricing::estimate_cost(&c.model, c.input, c.output, c.cache_read, c.cache_write_5m, c.cache_write_1h, overrides)
+            .amount
+    };
+    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
+    let excluded: u64 = daily.excluded.range(start..end.max(start)).map(|(_, n)| n).sum();
 
-    let mut projects_out = Vec::with_capacity(projects.len());
-    for (key, bucket) in projects {
-        let mut totals = bucket.totals;
-        let est = pricing::estimate_cost(
-            &bucket.model,
-            totals.input_tokens,
-            totals.output_tokens,
-            totals.cache_read_tokens,
-            bucket.cache_write_5m,
-            bucket.cache_write_1h,
-            overrides,
-        );
-        totals.cost = est.amount;
-        totals.cost_basis = est.amount.map(|_| CostBasis::ApiEquivalent);
-        projects_out.push(ProjectUsage {
-            name: project_display_name(&key),
-            path: key,
-            model: bucket.model,
-            totals,
-        });
-    }
-
-    let mut detail = format!("{} projects - {} files", projects_out.len(), files_scanned);
+    let mut detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
     if excluded > 0 {
         detail.push_str(&format!(" - {excluded} entries outside any project not counted"));
     }
-    AgentUsageReport::ok(AGENT, month_totals, projects_out, detail)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_entry(
-    bucket: &mut Bucket,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write_5m: u64,
-    cache_write_1h: u64,
-    reasoning: u64,
-    model: Option<&str>,
-) {
-    bucket.totals.entries += 1;
-    bucket.totals.input_tokens += input;
-    bucket.totals.output_tokens += output;
-    bucket.totals.cache_read_tokens += cache_read;
-    bucket.totals.cache_write_tokens += cache_write_5m + cache_write_1h;
-    bucket.cache_write_5m += cache_write_5m;
-    bucket.cache_write_1h += cache_write_1h;
-    bucket.totals.reasoning_tokens += reasoning;
-    if let Some(model) = model {
-        bucket.model = model.to_string();
-    }
+    AgentUsageReport::ok(AGENT, fold.totals, fold.projects, detail)
 }
 
 fn get_u64(node: &Value, name: &str) -> u64 {
@@ -454,6 +422,101 @@ mod tests {
         let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
         // claude-opus-5 cache_write_1h = 10.0 per 1M, not 6.25 (the 5m rate).
         assert_eq!(report.totals.cost, Some(10.0));
+    }
+
+    fn priced_line(request_id: &str, ts: &str, cwd: &str, model: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"requestId":"{request_id}","timestamp":"{ts}","cwd":"{cwd}","message":{{"id":"msg_{request_id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":1000000,"cache_creation":{{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}}}}}}}"#
+        )
+    }
+
+    /// Noon local time on `day` of September 2026, as the UTC the store writes.
+    fn noon(day: u32) -> String {
+        Local.with_ymd_and_hms(2026, 9, day, 12, 0, 0).unwrap().to_utc().to_rfc3339()
+    }
+
+    /// A window spanning two days with one model gives the totals the single
+    /// window-wide sum gave: the counters add up, and the per-day costs sum to
+    /// the price of the summed counters.
+    #[test]
+    fn a_window_over_two_days_gives_the_same_totals_as_one_sum() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = format!(
+            "{}\n{}\n",
+            priced_line("day-1", &noon(14), &cwd, "claude-opus-5", 1_000_000, 2_000_000),
+            priced_line("day-2", &noon(15), &cwd, "claude-opus-5", 3_000_000, 1_000_000),
+        );
+        fs::write(sessions.join("session.jsonl"), content).unwrap();
+
+        let (start, end) = window();
+        let overrides = pricing::PriceOverrides::default();
+        let report = read_usage(&sessions, start, end, &overrides, &mut fixture_cache(dir.path()));
+
+        let expected = pricing::estimate_cost(
+            "claude-opus-5",
+            4_000_000,
+            3_000_000,
+            2_000_000,
+            2_000_000,
+            2_000_000,
+            &overrides,
+        )
+        .amount
+        .expect("claude-opus-5 is priced");
+        assert_eq!(report.totals.entries, 2);
+        assert_eq!(report.totals.input_tokens, 4_000_000);
+        assert_eq!(report.totals.output_tokens, 3_000_000);
+        assert_eq!(report.totals.cache_read_tokens, 2_000_000);
+        assert_eq!(report.totals.cache_write_tokens, 4_000_000);
+        assert_eq!(report.totals.cost, Some(expected));
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].totals, report.totals);
+        assert_eq!(report.projects[0].model, "claude-opus-5");
+    }
+
+    /// Cost is priced per (day, project) bucket: a later bucket with an
+    /// unpriced model no longer erases the cost of the earlier, priced one,
+    /// in the agent totals or in a project whose model changed between days.
+    #[test]
+    fn an_unpriced_bucket_does_not_hide_the_cost_of_the_priced_ones() {
+        let dir = tempdir().unwrap();
+        let priced_repo = dir.path().join("priced");
+        let unpriced_repo = dir.path().join("unpriced");
+        fs::create_dir_all(priced_repo.join(".git")).unwrap();
+        fs::create_dir_all(unpriced_repo.join(".git")).unwrap();
+        let cwd = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = format!(
+            "{}\n{}\n{}\n",
+            priced_line("a", &noon(14), &cwd(&priced_repo), "claude-opus-5", 0, 1_000_000),
+            priced_line("b", &noon(15), &cwd(&priced_repo), "some-unknown-model", 0, 1_000_000),
+            priced_line("c", &noon(15), &cwd(&unpriced_repo), "some-unknown-model", 0, 5),
+        );
+        fs::write(sessions.join("session.jsonl"), content).unwrap();
+
+        let (start, end) = window();
+        let overrides = pricing::PriceOverrides::default();
+        let report = read_usage(&sessions, start, end, &overrides, &mut fixture_cache(dir.path()));
+
+        let day_one = pricing::estimate_cost("claude-opus-5", 0, 1_000_000, 1_000_000, 1_000_000, 1_000_000, &overrides)
+            .amount
+            .expect("claude-opus-5 is priced");
+        assert_eq!(report.totals.output_tokens, 2_000_005);
+        assert_eq!(report.totals.cost, Some(day_one));
+        assert_eq!(report.totals.cost_basis, Some(crate::usage::CostBasis::ApiEquivalent));
+
+        let priced = report.projects.iter().find(|p| p.name == "priced").expect("priced row");
+        assert_eq!(priced.totals.cost, Some(day_one));
+        assert_eq!(priced.model, "some-unknown-model");
+        let unpriced = report.projects.iter().find(|p| p.name == "unpriced").expect("unpriced row");
+        assert_eq!(unpriced.totals.cost, None);
+        assert_eq!(unpriced.totals.cost_basis, None);
     }
 
     /// Entries whose cwd is scratch (under the temp dir) or a folder outside
