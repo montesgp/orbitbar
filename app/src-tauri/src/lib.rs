@@ -6,6 +6,7 @@ mod placement;
 mod usage;
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tauri::{Manager, WebviewWindow};
 use tauri_plugin_autostart::ManagerExt;
 
@@ -328,6 +329,78 @@ fn sync_autostart(app: &tauri::AppHandle, cfg: &config::AppConfig) {
     }
 }
 
+/// The first update check runs this long after launch, so it never competes
+/// with the bar's own startup, and then every `UPDATE_INTERVAL`.
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(30);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Decides whether one update tick asks GitHub Releases for a new version:
+///   - a debug build never checks: it runs from target/debug, and installing
+///     a release would replace an installed copy, not the binary running;
+///   - `autoUpdate` off -> no check (re-read on every tick, so the menu
+///     toggle works without a restart);
+///   - on Linux only an AppImage (`APPIMAGE` set) can replace itself; a
+///     `.deb` or `.rpm` install is the package manager's to update.
+fn update_check_due(debug_build: bool, auto_update: bool, linux: bool, appimage: bool) -> bool {
+    !debug_build && auto_update && (!linux || appimage)
+}
+
+/// Starts the background update checks: the first after
+/// `UPDATE_FIRST_CHECK`, then every `UPDATE_INTERVAL`. A plain thread that
+/// sleeps between ticks; it dies with the process.
+#[cfg(desktop)]
+fn start_update_checks(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(UPDATE_FIRST_CHECK);
+        loop {
+            update_tick(&app);
+            std::thread::sleep(UPDATE_INTERVAL);
+        }
+    });
+}
+
+/// One tick. Like autostart, a failure is never fatal: an update that cannot
+/// be fetched or verified is logged and the next tick tries again.
+#[cfg(desktop)]
+fn update_tick(app: &tauri::AppHandle) {
+    // Read-only: `config::load` would rename and reset a config that does not
+    // parse, and this thread must never do that behind the user's back.
+    let auto_update = match config::config_dir(app).map(|dir| config::read_auto_update(&dir.join("config.json"))) {
+        Ok(Some(on)) => on,
+        Ok(None) => {
+            eprintln!("orbitbar: update check skipped, config.json could not be read");
+            return;
+        }
+        Err(e) => {
+            eprintln!("orbitbar: update check skipped, config folder unknown: {e}");
+            return;
+        }
+    };
+    let appimage = std::env::var_os("APPIMAGE").is_some();
+    if !update_check_due(cfg!(debug_assertions), auto_update, cfg!(target_os = "linux"), appimage) {
+        return;
+    }
+    if let Err(e) = tauri::async_runtime::block_on(install_update(app)) {
+        eprintln!("orbitbar: update check failed: {e}");
+    }
+}
+
+/// Fetches `latest.json` from the endpoint in tauri.conf.json and, when it
+/// names a newer version, downloads it, verifies its signature against the
+/// public key there (the plugin refuses an unsigned or wrongly signed file)
+/// and installs it, then restarts into the new version. On Windows the
+/// installer exits the app itself and starts the new version when done.
+#[cfg(desktop)]
+async fn install_update(app: &tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let Some(update) = app.updater()?.check().await? else {
+        return Ok(());
+    };
+    update.download_and_install(|_, _| {}, || {}).await?;
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -344,6 +417,9 @@ pub fn run() {
         }
     }));
 
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -355,6 +431,8 @@ pub fn run() {
             let window = app.get_webview_window("main").expect("main window");
             let cfg = config::load(app.handle())?;
             sync_autostart(app.handle(), &cfg);
+            #[cfg(desktop)]
+            start_update_checks(app.handle().clone());
 
             // Start in the persisted state: collapsed is a small chevron tab,
             // expanded is the full launcher. The bar goes where it was last
@@ -427,6 +505,39 @@ mod autostart_tests {
 }
 
 #[cfg(test)]
+mod update_tests {
+    use super::update_check_due;
+
+    /// A dev build runs from target/debug; installing a release over it
+    /// would replace the wrong binary, so it never checks.
+    #[test]
+    fn a_debug_build_never_checks() {
+        assert!(!update_check_due(true, true, false, false));
+        assert!(!update_check_due(true, true, true, true));
+    }
+
+    /// The menu toggle is read on every tick, so off means no check at all.
+    #[test]
+    fn updates_turned_off_never_check() {
+        assert!(!update_check_due(false, false, false, false));
+        assert!(!update_check_due(false, false, true, true));
+    }
+
+    /// A `.deb` or `.rpm` install belongs to the package manager; only an
+    /// AppImage (APPIMAGE set) can replace itself.
+    #[test]
+    fn linux_checks_only_as_an_appimage() {
+        assert!(!update_check_due(false, true, true, false));
+        assert!(update_check_due(false, true, true, true));
+    }
+
+    #[test]
+    fn a_release_build_with_updates_on_checks() {
+        assert!(update_check_due(false, true, false, false));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{SIZE_COLLAPSED, SIZE_EXPANDED};
 
@@ -475,5 +586,28 @@ mod tests {
     fn collapsed_tab_radii_never_overflow() {
         let r = SIZE_COLLAPSED.0 / 2;
         assert!(css_keeps_radii(r, r, SIZE_COLLAPSED.0, SIZE_COLLAPSED.1));
+    }
+}
+#[cfg(test)]
+mod updater_config_tests {
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    /// Installs trust only the project's key, over HTTPS, from this
+    /// repository's releases. A changed key or endpoint must be deliberate.
+    #[test]
+    fn the_updater_trusts_only_the_project_key_over_https() {
+        let v: serde_json::Value = serde_json::from_str(CONF).unwrap();
+        let u = &v["plugins"]["updater"];
+        assert_eq!(
+            u["pubkey"],
+            "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFRTQwM0YxRkVDN0REODcKUldTSDNjZis4UVBrVG1DcHZ4ZzVDK202VlVjSHQ1WXY5NnExdUlsdm9iOThuczJxRnEvTWI4NWgK"
+        );
+        assert_eq!(
+            u["endpoints"],
+            serde_json::json!(["https://github.com/montesgp/orbitbar/releases/latest/download/latest.json"])
+        );
+        assert_eq!(u["windows"]["installMode"], "passive");
+        assert!(u.get("dangerousInsecureTransportProtocol").is_none());
+        assert_eq!(v["bundle"]["createUpdaterArtifacts"], true);
     }
 }

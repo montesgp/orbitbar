@@ -22,10 +22,12 @@ flowchart LR
     direction TB
     CMD["Tauri commands<br/>get_config · save_config · get_usage<br/>get_config_path · ensure_pricing_file · quit_app"]
     CFG["config.rs<br/>schema, load/save, themes"]
+    UPD["lib.rs update checks<br/>tauri-plugin-updater"]
     USAGE["usage/mod.rs<br/>collect_usage, TimeWindow"]
     PRICE["usage/pricing.rs<br/>built-in table + pricing.json"]
     LEDGER["usage/ledger.rs<br/>usage-ledger.json, claude + pi daily buckets"]
     CMD --> CFG
+    UPD -->|"autoUpdate, each tick"| CFG
     CMD --> USAGE
     USAGE --> PRICE
     USAGE -->|"read + write (own file)"| LEDGER
@@ -56,10 +58,14 @@ flowchart LR
   RO -->|"read-only SQLite"| OP
   RP -->|"read-only"| PI
   CMD -->|"JSON payload"| MAIN
+  GH[("GitHub Releases<br/>latest.json + signed bundles")]
+  UPD -->|"HTTPS, every 6 h"| GH
 ```
 
-Every read is a local file, and the frontend talks to the Rust core only
-through Tauri's `invoke()` IPC. The agents' files are only read; the one
+Every usage read is a local file, and the frontend talks to the Rust core
+only through Tauri's `invoke()` IPC. The one network call is the update
+check against this repository's GitHub Releases (see the cross-platform
+notes), which `autoUpdate` turns off. The agents' files are only read; the one
 file the usage code writes is Orbitbar's own `usage-ledger.json` in its
 config directory.
 
@@ -69,7 +75,7 @@ config directory.
 | --- | --- | --- |
 | Window/UI | `app/src/main.ts`, `app/src/styles.css`, `app/index.html` | Crescent bar geometry, collapse/expand, drag, theme application, item clicks, panel and context-menu toggling |
 | View-model | `app/src/usage-view.ts` | Pure functions that turn a `UsageSnapshot` into rendered lines — no DOM, unit-testable in isolation |
-| Tauri commands | `app/src-tauri/src/lib.rs` | `get_config`, `save_config`, `get_usage`, `get_config_path`, `ensure_pricing_file`, `run_command`, `run_panel_command`, `quit_app`, `place_window`, `plan_window`; window placement and autostart reconciliation on launch |
+| Tauri commands | `app/src-tauri/src/lib.rs` | `get_config`, `save_config`, `get_usage`, `get_config_path`, `ensure_pricing_file`, `run_command`, `run_panel_command`, `quit_app`, `place_window`, `plan_window`; window placement and autostart reconciliation on launch; the background update checks (`update_check_due` decides each tick) |
 | Panel commands | `app/src-tauri/src/panel.rs`, `app/src-tauri/src/launch.rs` | `panel:<program> [args]` items: `launch.rs` parses and resolves the command exactly like `run:`; `panel.rs` runs it with no console window, closed stdin, a 10 s timeout and a 64 KiB cap, strips terminal escapes and returns text, stderr, exit code and a timeout flag. The frontend shows it as preformatted text (`panel-output-view.ts`) |
 | Placement | `app/src-tauri/src/placement.rs` | Pure window-placement rules: grow toward the side with room, clamp into the work area, collapse anchoring, restoring a saved position |
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
@@ -220,6 +226,19 @@ beyond wiring the new item's `action` to the new `invoke()` call.
   system" entry and the `toggle-autostart` cell share one frontend toggle
   that flips the OS entry (direction taken from the real registration) and
   then persists `autoStart`.
+- Updates use `tauri-plugin-updater`, driven from Rust only (no frontend
+  permission). A thread started in `setup` checks about 30 s after launch and
+  then every 6 hours. Each tick re-reads `config.json`; `update_check_due`
+  skips it in a debug build, when `autoUpdate` is false, and on Linux unless
+  the app runs as an AppImage (`APPIMAGE` set; a `.deb` or `.rpm` belongs to
+  the package manager). A due tick fetches `latest.json` from
+  `plugins.updater.endpoints` in `tauri.conf.json`; when it names a newer
+  version the plugin downloads the bundle, verifies its minisign signature
+  against `plugins.updater.pubkey`, installs it and Orbitbar restarts. On
+  Windows the NSIS installer runs in passive mode and restarts the app itself.
+  Every failure is logged and the next tick tries again. The Release workflow
+  signs the bundles with the private key from the repository secrets and
+  uploads `latest.json`.
 - The webview is WebView2 on Windows, WKWebView on macOS and WebKitGTK 4.1 on
   Linux.
 - `usage-ledger.json` lives next to `config.json` (see the data flow above);
@@ -236,7 +255,7 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src/main.ts` | Window sizing/positioning, theme application, config load/save, item click handling |
 | `app/src/usage-view.ts` | Usage panel view-model: formatting, window options, per-agent/per-project rendering |
 | `app/src/styles.css` | Bar and panel styling, driven by `--ob-*` custom properties |
-| `app/src-tauri/src/lib.rs` | Tauri commands, applying window placement, autostart reconciliation, single-instance guard |
+| `app/src-tauri/src/lib.rs` | Tauri commands, applying window placement, autostart reconciliation, single-instance guard, update checks |
 | `app/src-tauri/src/placement.rs` | Pure placement rules (unit tested) |
 | `app/src-tauri/src/config.rs` | Config schema, load/save, theme palettes |
 | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, `UsageSnapshot`, project-path normalization |

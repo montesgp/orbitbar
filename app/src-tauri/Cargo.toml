@@ -1,6 +1,6 @@
 [package]
 name = "orbitbar"
-version = "0.2.0"
+version = "0.3.0"
 description = "Floating desktop bar with token usage metrics for local AI coding agents"
 authors = ["Orbitbar contributors"]
 edition = "2021"
@@ -33,8 +33,10 @@ chrono = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # A second launch must hand over to the running bar, not open another one.
+# The updater installs signed releases from GitHub (see `start_update_checks` in lib.rs).
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }

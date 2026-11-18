@@ -68,6 +68,9 @@ export interface OrbitbarConfig {
   fontSize: number;
   /** Desired autostart state. Rust reconciles the OS entry against it on start. */
   autoStart: boolean;
+  /** Whether Rust checks GitHub Releases for signed updates and installs
+   * them. On by default; read again on every check. */
+  autoUpdate: boolean;
   /** Whether items flagged `example` are visible. Off by default. */
   showExamples: boolean;
   /** Where the bar was last dropped (physical screen pixels, top-left). Absent
@@ -108,11 +111,11 @@ const PANEL_WIDTH = 320;
  * the height, not just the width.
  */
 const CONTEXT_MENU_WIDTH = 170;
-const CONTEXT_MENU_MIN_HEIGHT = 337;
-/** Nine entries plus three separators, sized from `.context-menu`'s own CSS;
+const CONTEXT_MENU_MIN_HEIGHT = 364;
+/** Ten entries plus three separators, sized from `.context-menu`'s own CSS;
  * kept as a constant instead of measured so opening the menu never needs an
  * extra hidden-then-remeasure paint. */
-const CONTEXT_MENU_HEIGHT_ESTIMATE = 310;
+const CONTEXT_MENU_HEIGHT_ESTIMATE = 337;
 
 const win = getCurrentWindow();
 
@@ -404,7 +407,8 @@ interface ContextMenuAction {
  * The fixed entry list, in order. "Collapse"/"Expand" reflects `cfg.collapsed`
  * so the label always matches what the click will actually do, and the theme
  * choice in effect (`currentTheme`, the resolved palette name) carries a check,
- * and so does "Start with system" when `autostartOn` (the real OS registration).
+ * and so does "Start with system" when `autostartOn` (the real OS registration)
+ * and "Automatic updates" when `cfg.autoUpdate`.
  */
 function buildContextMenuActions(
   cfg: OrbitbarConfig,
@@ -415,6 +419,7 @@ function buildContextMenuActions(
     reloadConfig: () => void | Promise<void>;
     setTheme: (theme: ThemeName) => void | Promise<void>;
     toggleAutostart: () => void | Promise<void>;
+    toggleAutoUpdate: () => void | Promise<void>;
     toggleExamples: () => void | Promise<void>;
     quit: () => void | Promise<void>;
   },
@@ -439,6 +444,12 @@ function buildContextMenuActions(
       checked: autostartOn,
       kind: "checkbox",
       run: handlers.toggleAutostart,
+    },
+    {
+      label: "Automatic updates",
+      checked: cfg.autoUpdate,
+      kind: "checkbox",
+      run: handlers.toggleAutoUpdate,
     },
     {
       label: "Show example action",
@@ -1232,6 +1243,13 @@ window.addEventListener("DOMContentLoaded", async () => {
       await persistConfig(cfg);
     };
 
+    // Persists the choice; Rust reads it again before each update check, so
+    // nothing else needs to change now.
+    const toggleAutoUpdate = async () => {
+      cfg.autoUpdate = !cfg.autoUpdate;
+      await persistConfig(cfg);
+    };
+
     // Shows or hides the example cells in place and persists the choice.
     const toggleExamples = async () => {
       cfg.showExamples = !cfg.showExamples;
@@ -1250,7 +1268,17 @@ window.addEventListener("DOMContentLoaded", async () => {
     const contextMenuActions = async () =>
       buildContextMenuActions(
         cfg,
-        { openConfig, openPricing, toggleCollapsed, reloadConfig, setTheme, toggleAutostart, toggleExamples, quit },
+        {
+          openConfig,
+          openPricing,
+          toggleCollapsed,
+          reloadConfig,
+          setTheme,
+          toggleAutostart,
+          toggleAutoUpdate,
+          toggleExamples,
+          quit,
+        },
         themeName,
         (await readAutostart()) ?? cfg.autoStart,
       );
