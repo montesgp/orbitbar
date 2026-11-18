@@ -8,6 +8,7 @@
 //! missing store on one agent never hides the others: each carries its own
 //! [`AgentStatus`].
 
+pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod daily;
@@ -18,7 +19,7 @@ pub mod pricing;
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// The time window a snapshot is computed over. `Today` is the default: the
@@ -272,9 +273,19 @@ pub fn normalize_project_path(path: &str) -> String {
     }
 }
 
+/// The project key of every entry that belongs to no repository: a cwd under
+/// the OS temp dir, an existing folder outside any repository, or no cwd at
+/// all (see [`project_key`]). It counts like any project and is shown as the
+/// "Outside projects" row.
+pub const OUTSIDE_PROJECTS: &str = "";
+
 /// The display name for a project key: its last path segment, falling back
-/// to the whole key when there is no separator (e.g. a bare drive root).
+/// to the whole key when there is no separator (e.g. a bare drive root), and
+/// "Outside projects" for [`OUTSIDE_PROJECTS`].
 pub fn project_display_name(key: &str) -> String {
+    if key == OUTSIDE_PROJECTS {
+        return "Outside projects".to_string();
+    }
     key.rsplit(['\\', '/'])
         .find(|s| !s.is_empty())
         .unwrap_or(key)
@@ -338,9 +349,108 @@ impl Default for ProjectRootCache {
     }
 }
 
+/// The project key of a session `cwd`: its project root, or
+/// [`OUTSIDE_PROJECTS`] when it has none (see [`resolve_project_root`]) or
+/// is empty.
+pub fn project_key(cwd: &str, cache: &mut ProjectRootCache) -> String {
+    resolve_project_root(cwd, cache).unwrap_or_else(|| OUTSIDE_PROJECTS.to_string())
+}
+
+/// `projectAliases` from `config.json`: project keys that are reported under
+/// another project. Applied only when a window is reported (the fold and the
+/// codex and opencode rows); the ledger and the Pi claude-bridge check keep
+/// the un-aliased keys, so a changed alias applies to the whole history.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectAliases {
+    /// `(source, target)`, both normalized, longest source first.
+    entries: Vec<(String, String)>,
+}
+
+impl ProjectAliases {
+    /// Normalizes every path like [`normalize_project_path`]; an alias whose
+    /// source or target is empty is ignored. Neither path has to exist.
+    pub fn new<'a>(aliases: impl IntoIterator<Item = (&'a String, &'a String)>) -> Self {
+        let mut entries: Vec<(String, String)> = aliases
+            .into_iter()
+            .map(|(source, target)| (normalize_project_path(source), normalize_project_path(target)))
+            .filter(|(source, target)| !source.is_empty() && !target.is_empty())
+            .collect();
+        entries.sort_by_key(|(source, _)| std::cmp::Reverse(source.len()));
+        Self { entries }
+    }
+
+    /// The key `key` is reported under: the target of the longest alias whose
+    /// path is `key` or one of its ancestors (whole components, letter case
+    /// ignored on Windows only), or `key` itself. [`OUTSIDE_PROJECTS`] is
+    /// never aliased.
+    pub fn resolve<'a>(&'a self, key: &'a str) -> &'a str {
+        if key == OUTSIDE_PROJECTS {
+            return key;
+        }
+        self.entries
+            .iter()
+            .find(|(source, _)| is_within(key, Path::new(source)))
+            .map_or(key, |(_, target)| target.as_str())
+    }
+
+    /// Merges the rows whose keys resolve to the same project into one row
+    /// under that key: tokens, entries and cost summed (the cost is `None`
+    /// only when no merged row had one), the model the one with the most
+    /// output over the merged rows. For readers that price a whole row at
+    /// once (codex) or report it (opencode); the daily fold aliases its keys
+    /// itself.
+    pub fn merge_rows(&self, rows: Vec<ProjectUsage>) -> Vec<ProjectUsage> {
+        if self.entries.is_empty() {
+            return rows;
+        }
+        let mut merged: Vec<(ProjectUsage, BTreeMap<String, u64>, usize)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let key = self.resolve(&row.path).to_string();
+            let Some(&i) = index.get(&key) else {
+                let models = BTreeMap::from([(row.model.clone(), row.totals.output_tokens)]);
+                let row = ProjectUsage { name: project_display_name(&key), path: key.clone(), ..row };
+                index.insert(key, merged.len());
+                merged.push((row, models, 1));
+                continue;
+            };
+            let (into, models, count) = &mut merged[i];
+            *models.entry(row.model).or_default() += row.totals.output_tokens;
+            *count += 1;
+            let (to, from) = (&mut into.totals, row.totals);
+            to.input_tokens += from.input_tokens;
+            to.output_tokens += from.output_tokens;
+            to.cache_read_tokens += from.cache_read_tokens;
+            to.cache_write_tokens += from.cache_write_tokens;
+            to.reasoning_tokens += from.reasoning_tokens;
+            to.entries += from.entries;
+            if let Some(cost) = from.cost {
+                *to.cost.get_or_insert(0.0) += cost;
+                to.cost_basis = to.cost_basis.or(from.cost_basis);
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(mut row, models, count)| {
+                if count > 1 {
+                    // The same 4 decimals a priced row carries, without float noise.
+                    row.totals.cost = row.totals.cost.map(|c| (c * 10_000.0).round() / 10_000.0);
+                    row.model = models
+                        .into_iter()
+                        .filter(|(model, _)| !model.is_empty())
+                        .max_by_key(|(model, output)| (*output, model.clone()))
+                        .map(|(model, _)| model)
+                        .unwrap_or_default();
+                }
+                row
+            })
+            .collect()
+    }
+}
+
 /// Resolves the project root for a session `cwd`, or `None` when the session
-/// does not belong to any project and must not be counted at all (neither in
-/// a project row nor in the agent totals). In order:
+/// belongs to no project ([`project_key`] then keys it [`OUTSIDE_PROJECTS`]).
+/// An empty `cwd` gives `Some("")`. In order:
 ///
 /// 1. A cwd under the OS temp dir is scratch work (for example a review
 ///    subprocess), excluded whether or not it still exists.
@@ -548,20 +658,31 @@ pub struct UsageSnapshot {
 /// are cheaper than the coordination a parallel version would need, and a
 /// broken one never blocks the others because each is wrapped in its own
 /// `AgentUsageReport`.
+///
+/// Every agent's projects are reported under `aliases` (`projectAliases` in
+/// `config.json`); the ledger and the claude-bridge check use the un-aliased
+/// keys.
+///
+/// The claude, pi and codex files are read through `cache` (see
+/// `usage::cache`): only the files that changed since its last collect are
+/// read again. The app passes `UsageCache::global()`; a fresh cache reads
+/// every file, with the same result.
 pub fn collect_usage(
     window: TimeWindow,
     paths: &UsagePaths,
     now: DateTime<Local>,
     overrides: &pricing::PriceOverrides,
     ledger_path: Option<&Path>,
+    aliases: &ProjectAliases,
+    cache: &cache::UsageCache,
 ) -> UsageSnapshot {
     let (start, end) = window_range(window, now);
     let (first_day, end_day) = (start.date_naive(), end.date_naive());
     let mut root_cache = ProjectRootCache::new();
 
-    let claude_daily = claude::read_daily(&paths.claude_dir, &mut root_cache);
-    let codex = codex::read_usage(&paths.codex_dir, start, end, overrides, &mut root_cache);
-    let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache);
+    let claude_daily = claude::read_daily(&paths.claude_dir, &cache.claude, &mut root_cache);
+    let codex = codex::read_usage_cached(&paths.codex_dir, start, end, overrides, &mut root_cache, aliases, &cache.codex);
+    let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache, aliases);
 
     // The ledger is locked from here until it is written, so the claude and
     // pi merges of concurrent calls never interleave.
@@ -574,16 +695,16 @@ pub fn collect_usage(
             if let Some(ledger) = ledger.as_mut() {
                 daily.buckets = ledger.merge(claude::AGENT, &daily.buckets);
             }
-            (claude::report(&daily, first_day, end_day, overrides), daily.buckets)
+            (claude::report(&daily, first_day, end_day, overrides, aliases), daily.buckets)
         }
         Err(report) => (*report, ledger.as_ref().map(|l| l.stored(claude::AGENT)).unwrap_or_default()),
     };
-    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &mut root_cache) {
+    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &cache.pi, &mut root_cache) {
         Ok(mut daily) => {
             if let Some(ledger) = ledger.as_mut() {
                 daily.buckets = ledger.merge(pi::AGENT, &daily.buckets);
             }
-            pi::report(&daily, first_day, end_day, overrides)
+            pi::report(&daily, first_day, end_day, overrides, aliases)
         }
         Err(report) => *report,
     };
@@ -706,11 +827,123 @@ mod tests {
         assert_eq!(normalize_project_path(""), "");
     }
 
+    /// A normalized key from a forward-slash path, so one test runs on every OS.
+    fn k(path: &str) -> String {
+        normalize_project_path(path)
+    }
+
+    fn aliases(pairs: &[(&str, &str)]) -> ProjectAliases {
+        let map: std::collections::BTreeMap<String, String> =
+            pairs.iter().map(|(s, t)| (s.to_string(), t.to_string())).collect();
+        ProjectAliases::new(&map)
+    }
+
+    /// A key equal to an alias path or under it, by whole components, is
+    /// reported under the normalized target; a sibling sharing a prefix is not.
+    #[test]
+    fn an_alias_matches_its_path_and_everything_under_it() {
+        let a = aliases(&[("/r/x/sortea-wt/", "/r/x/sortea/")]);
+        assert_eq!(a.resolve(&k("/r/x/sortea-wt")), k("/r/x/sortea"), "equal");
+        assert_eq!(a.resolve(&k("/r/x/sortea-wt/t1")), k("/r/x/sortea"), "under");
+        assert_eq!(a.resolve(&k("/r/x/sortea-wt2")), k("/r/x/sortea-wt2"), "a sibling with a shared prefix");
+        assert_eq!(a.resolve(&k("/r/x/sortea")), k("/r/x/sortea"));
+        assert_eq!(a.resolve(&k("/r/x")), k("/r/x"), "a parent is not under the alias");
+    }
+
+    #[test]
+    fn the_longest_matching_alias_wins() {
+        let a = aliases(&[("/r/x", "/r/broad"), ("/r/x/a/b", "/r/narrow")]);
+        assert_eq!(a.resolve(&k("/r/x/a/b/c")), k("/r/narrow"));
+        assert_eq!(a.resolve(&k("/r/x/a/b")), k("/r/narrow"));
+        assert_eq!(a.resolve(&k("/r/x/a/c")), k("/r/broad"));
+    }
+
+    /// The outside-projects key is never aliased, and an alias with an empty
+    /// source or target is ignored.
+    #[test]
+    fn the_outside_projects_key_is_never_aliased() {
+        let a = aliases(&[("", "/r/x"), ("  ", "/r/x"), ("/r/y", ""), ("/r/z", "/r/target")]);
+        assert_eq!(a.resolve(OUTSIDE_PROJECTS), OUTSIDE_PROJECTS);
+        assert_eq!(a.resolve(&k("/r/y/sub")), k("/r/y/sub"), "an empty target is ignored");
+        assert_eq!(a.resolve(&k("/r/z")), k("/r/target"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_alias_ignores_letter_case_on_windows() {
+        let a = aliases(&[("R:/X/Sortea-WT", "R:/x/sortea")]);
+        assert_eq!(a.resolve("r:\\x\\sortea-wt\\t1"), "R:\\x\\sortea");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn an_alias_is_case_sensitive_on_macos_and_linux() {
+        let a = aliases(&[("/R/X/Sortea-WT", "/r/x/sortea")]);
+        assert_eq!(a.resolve("/r/x/sortea-wt/t1"), "/r/x/sortea-wt/t1");
+        assert_eq!(a.resolve("/R/X/Sortea-WT/t1"), "/r/x/sortea");
+    }
+
+    /// Rows that resolve to one target merge: tokens, entries and cost summed
+    /// (a missing cost adds nothing), the model the one with the most output.
+    /// Other rows are left as they are.
+    #[test]
+    fn merge_rows_sums_the_rows_of_one_alias_target() {
+        let row = |path: &str, model: &str, output: u64, cost: Option<f64>| ProjectUsage {
+            path: k(path),
+            name: project_display_name(&k(path)),
+            model: model.into(),
+            totals: UsageTotals {
+                input_tokens: 1,
+                output_tokens: output,
+                cache_read_tokens: 2,
+                cache_write_tokens: 3,
+                reasoning_tokens: 4,
+                cost,
+                cost_basis: cost.map(|_| CostBasis::ApiEquivalent),
+                entries: 1,
+            },
+        };
+        let a = aliases(&[("/r/x/sortea-wt", "/r/x/sortea")]);
+        let other = row("/r/x/other", "m", 7, None);
+        let merged = a.merge_rows(vec![
+            row("/r/x/sortea", "small", 10, Some(1.25)),
+            row("/r/x/sortea-wt/t1", "big", 30, None),
+            row("/r/x/sortea-wt/t2", "small", 15, Some(0.5)),
+            other.clone(),
+            row("", "m", 1, None),
+        ]);
+
+        let sortea = merged.iter().find(|r| r.path == k("/r/x/sortea")).expect("merged row");
+        assert_eq!(sortea.name, "sortea");
+        assert_eq!(sortea.model, "big", "big has 30 output, small 10 + 15");
+        assert_eq!(
+            sortea.totals,
+            UsageTotals {
+                input_tokens: 3,
+                output_tokens: 55,
+                cache_read_tokens: 6,
+                cache_write_tokens: 9,
+                reasoning_tokens: 12,
+                cost: Some(1.75),
+                cost_basis: Some(CostBasis::ApiEquivalent),
+                entries: 3,
+            }
+        );
+        assert!(merged.contains(&other));
+        assert!(merged.iter().any(|r| r.path.is_empty() && r.name == "Outside projects"));
+        assert_eq!(merged.len(), 3);
+
+        let unpriced = a.merge_rows(vec![row("/r/x/sortea-wt", "m", 1, None), row("/r/x/sortea", "m", 1, None)]);
+        assert_eq!(unpriced[0].totals.cost, None, "no row priced, no cost");
+        assert_eq!(unpriced[0].totals.cost_basis, None);
+    }
+
     #[test]
     fn project_display_name_is_the_last_segment() {
         assert_eq!(project_display_name("C:\\repos\\orbitbar"), "orbitbar");
         assert_eq!(project_display_name("/home/user/orbitbar"), "orbitbar");
         assert_eq!(project_display_name("orbitbar"), "orbitbar");
+        assert_eq!(project_display_name(OUTSIDE_PROJECTS), "Outside projects");
     }
 
     #[test]
@@ -732,7 +965,7 @@ mod tests {
     fn collect_usage_reports_claude_codex_opencode_then_pi() {
         let dir = tempdir().unwrap();
         let paths = resolve_paths(Some(dir.path())).unwrap();
-        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None);
+        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None, &ProjectAliases::default(), &cache::UsageCache::default());
 
         let agents: Vec<&str> = snapshot.agents.iter().map(|a| a.agent.as_str()).collect();
         assert_eq!(agents, vec!["claude", "codex", "opencode", "pi"]);
@@ -747,7 +980,7 @@ mod tests {
         let paths = resolve_paths(Some(dir.path())).unwrap();
         let now = local(2026, 9, 15, 18, 0);
         let ts = |h: u32| local(2026, 9, 15, h, 0).to_utc().to_rfc3339();
-        // No cwd on either side: both land in the no-project bucket, so the
+        // No cwd on either side: both land in the outside-projects bucket, so the
         // test never depends on the machine's real temp or home directory.
         std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
         std::fs::write(
@@ -776,7 +1009,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None);
+        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None, &ProjectAliases::default(), &cache::UsageCache::default());
         let claude = &snapshot.agents[0];
         let pi = &snapshot.agents[3];
         assert_eq!(claude.totals.output_tokens, 10);
@@ -787,7 +1020,7 @@ mod tests {
     }
 
     /// A home for the ledger tests: claude and pi files with no cwd (the
-    /// no-project bucket, so nothing depends on the real temp or home
+    /// outside-projects bucket, so nothing depends on the real temp or home
     /// directory), and a ledger in a config folder of its own.
     struct LedgerHome {
         dir: tempfile::TempDir,
@@ -836,7 +1069,7 @@ mod tests {
         }
 
         fn collect(&self, ledger: Option<&Path>) -> UsageSnapshot {
-            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger)
+            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger, &ProjectAliases::default(), &cache::UsageCache::default())
         }
     }
 
@@ -849,7 +1082,7 @@ mod tests {
         local(2026, 9, day, 12, 0).to_utc().to_rfc3339()
     }
 
-    /// A ledger file holding one no-project claude record per `(date, entries, output)`.
+    /// A ledger file holding one outside-projects claude record per `(date, entries, output)`.
     fn ledger_file(records: &[(&str, u64, u64)]) -> String {
         let days: Vec<serde_json::Value> = records
             .iter()
@@ -908,13 +1141,37 @@ mod tests {
         assert_eq!(reread.buckets("claude").iter().count(), 2, "a new day is written");
     }
 
+    /// A version 1 ledger is read as is and rewritten as version 2 by the
+    /// next collect, with the same records and the same totals.
+    #[test]
+    fn a_version_1_ledger_is_rewritten_as_version_2_with_the_same_totals() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let v1 = ledger_file(&[("2026-09-01", 9, 900), ("2026-09-14", 2, 20)]);
+        std::fs::write(&ledger, &v1).unwrap();
+
+        let first = home.collect(Some(&ledger));
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_str(&v1).unwrap();
+        expected["version"] = 2.into();
+        assert_eq!(json, expected, "same records, version 2");
+
+        let second = home.collect(Some(&ledger));
+        let claude = &first.agents[0];
+        assert_eq!(claude.totals.entries, 11);
+        assert_eq!(claude.totals.output_tokens, 920);
+        assert!(claude.totals.cost.is_some());
+        assert_eq!(second.agents[0].totals, claude.totals, "the v2 file gives the same totals");
+    }
+
     /// A ledger Orbitbar cannot use is never overwritten: the call reads the
     /// agents' files only and the claude and pi details say why.
     #[test]
     fn a_corrupt_or_unknown_version_ledger_is_left_untouched() {
         for (content, reason) in [
             ("{ not json".to_string(), "not a valid ledger"),
-            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":2"#), "unknown version 2"),
+            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":3"#), "unknown version 3"),
         ] {
             let home = LedgerHome::new();
             let ledger = home.ledger();
@@ -1028,6 +1285,281 @@ mod tests {
         let days: Vec<String> =
             ledger::load(&ledger).unwrap().buckets("claude").iter().map(|(d, _, _)| d.to_string()).collect();
         assert_eq!(days, vec![kept]);
+    }
+
+    /// An alias merges two project rows into one at report time, while the
+    /// ledger keeps both keys as they were read. Usage outside projects is
+    /// left alone. The cwds are missing folders directly under the home, so
+    /// the real resolver keys each by its own folder without creating it.
+    #[test]
+    fn an_alias_merges_rows_in_the_report_but_not_in_the_ledger() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        let Some(user_home) = dirs::home_dir() else { return };
+        let folder = |name: &str| {
+            let dir = user_home.join(format!("orbitbar-alias-test-{}-{name}", std::process::id()));
+            dir.to_string_lossy().replace('\\', "/")
+        };
+        let (wt, main) = (format!("{}/t1", folder("sortea-wt")), folder("sortea"));
+        let key = |cwd: &str| resolve_project_root(cwd, &mut ProjectRootCache::new()).expect("a vanished folder");
+        let (wt_key, main_key) = (key(&wt), key(&main));
+        assert_ne!(wt_key, main_key);
+
+        let line = |id: &str, day: u32, cwd: &str, output: u64| {
+            format!(
+                r#"{{"requestId":"{id}","timestamp":"{}","cwd":"{cwd}","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#,
+                ts(day)
+            )
+        };
+        let content = [line("r1", 14, &wt, 10), line("r2", 15, &main, 20), line("r3", 15, "", 5)].join("\n");
+        std::fs::write(home.paths.claude_dir.join("p").join("s.jsonl"), content + "\n").unwrap();
+
+        let map = std::collections::BTreeMap::from([(wt_key.clone(), format!("{main}/"))]);
+        let snapshot = collect_usage(
+            TimeWindow::ThisMonth,
+            &home.paths,
+            ledger_now(),
+            &pricing::PriceOverrides::default(),
+            Some(&ledger),
+            &ProjectAliases::new(&map),
+            &cache::UsageCache::default(),
+        );
+        let claude = &snapshot.agents[0];
+        let rows: Vec<(&str, u64, u64)> =
+            claude.projects.iter().map(|p| (p.path.as_str(), p.totals.output_tokens, p.totals.entries)).collect();
+        assert_eq!(rows, vec![(main_key.as_str(), 30, 2), ("", 5, 1)], "one merged row, outside projects untouched");
+        assert_eq!(claude.projects[0].name, project_display_name(&main_key));
+        assert_eq!(claude.totals.output_tokens, 35);
+
+        let stored = ledger::load(&ledger).unwrap().buckets("claude");
+        let mut keys: Vec<&str> = stored.groups().map(|(_, p)| p).collect();
+        keys.sort();
+        let mut expected = vec!["", wt_key.as_str(), main_key.as_str()];
+        expected.sort();
+        assert_eq!(keys, expected, "the ledger keeps the un-aliased keys");
+    }
+
+    /// A home with session files of all four agents over several days of
+    /// September 2026, for the file-cache tests. Output token counts are two
+    /// digits, so a test can rewrite a file at the same length.
+    struct CacheHome {
+        home: LedgerHome,
+    }
+
+    impl CacheHome {
+        fn new() -> Self {
+            let home = LedgerHome::new();
+            home.claude("a.jsonl", &[("r1", 10, 11), ("r2", 12, 12), ("r3", 14, 13)]);
+            home.claude("b.jsonl", &[("r1", 12, 21), ("r4", 15, 22)]);
+            home.pi("s.jsonl", &[("c1", 10, "openai-codex", 31), ("b1", 12, "claude-bridge", 32), ("b2", 13, "claude-bridge", 33)]);
+            std::fs::create_dir_all(&home.paths.codex_dir).unwrap();
+            let me = Self { home };
+            me.codex("one.jsonl", 11, 41);
+            me.codex("two.jsonl", 14, 42);
+            me.opencode(12, 51);
+            me
+        }
+
+        fn codex_path(&self, name: &str) -> PathBuf {
+            self.home.paths.codex_dir.join(name)
+        }
+
+        fn codex(&self, name: &str, day: u32, output: u64) {
+            let line = format!(
+                r#"{{"timestamp":"{}","payload":{{"cwd":"","model":"gpt-5.6-luna","turn_token_usage":{{"input_tokens":100,"output_tokens":{output},"cached_input_tokens":10,"cache_write_input_tokens":0,"reasoning_output_tokens":2}}}}}}"#,
+                ts(day)
+            );
+            std::fs::write(self.codex_path(name), line + "\n").unwrap();
+        }
+
+        fn opencode(&self, day: u32, output: u64) {
+            let db = &self.home.paths.opencode_db;
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, time_updated INTEGER, cost REAL,
+                     tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+                     tokens_cache_read INTEGER, tokens_cache_write INTEGER);
+                 INSERT INTO project (id, worktree) VALUES ('p1', '');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session VALUES ('s1', 'p1', ?1, 0.5, 100, ?2, 0, 0, 0)",
+                rusqlite::params![local(2026, 9, day, 12, 0).timestamp_millis(), output as i64],
+            )
+            .unwrap();
+        }
+
+        fn claude_path(&self, name: &str) -> PathBuf {
+            self.home.paths.claude_dir.join("p").join(name)
+        }
+
+        fn pi_path(&self) -> PathBuf {
+            self.home.paths.pi_dir.join("p").join("s.jsonl")
+        }
+
+        /// A ThisMonth collect through `cache`, without a ledger.
+        fn collect(&self, cache: &cache::UsageCache) -> UsageSnapshot {
+            collect_usage(
+                TimeWindow::ThisMonth,
+                &self.home.paths,
+                ledger_now(),
+                &pricing::PriceOverrides::default(),
+                None,
+                &ProjectAliases::default(),
+                cache,
+            )
+        }
+
+        /// A collect with an empty cache, as JSON.
+        fn cold(&self) -> serde_json::Value {
+            json(&self.collect(&cache::UsageCache::default()))
+        }
+    }
+
+    fn json(snapshot: &UsageSnapshot) -> serde_json::Value {
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    /// `(entries, output)` of each agent, in snapshot order.
+    fn agent_totals(snapshot: &UsageSnapshot) -> Vec<(u64, u64)> {
+        snapshot.agents.iter().map(|a| (a.totals.entries, a.totals.output_tokens)).collect()
+    }
+
+    /// Rewrites `path` with `content` and puts its modified time back, so its
+    /// length and modified time are what they were.
+    fn rewrite_keeping_length_and_mtime(path: &Path, content: &str) {
+        let before = std::fs::metadata(path).unwrap();
+        assert_eq!(before.len(), content.len() as u64, "same length");
+        std::fs::write(path, content).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), before.modified().unwrap());
+    }
+
+    fn touch_later(path: &Path) {
+        let later = std::fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(later).unwrap();
+    }
+
+    /// A collect over a warm cache gives exactly the snapshot a cold one
+    /// gives, for every agent and a window of several days, and reads no
+    /// file again.
+    #[test]
+    fn a_warm_cache_gives_the_same_snapshot_as_a_cold_one() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        let first = home.collect(&cache);
+        let parsed = (cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed());
+        assert_eq!(parsed, (2, 1, 2), "the first collect reads every file once");
+        let warm = home.collect(&cache);
+
+        assert_eq!(json(&warm), home.cold(), "warm equals cold");
+        assert_eq!(json(&first), json(&warm));
+        assert_eq!(
+            agent_totals(&warm),
+            vec![(5, 79), (2, 83), (1, 51), (2, 64)],
+            "claude 11+12+13+21+22; codex 41+42; opencode 51; pi 31 + the day-13 bridge turn"
+        );
+        assert_eq!((cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed()), parsed, "nothing read again");
+    }
+
+    /// A file whose length and modified time did not change is not read
+    /// again: rewritten in place at the same length with the old modified
+    /// time put back, its old counts still show. Once its modified time
+    /// moves, it is read again.
+    #[test]
+    fn an_unchanged_file_is_not_read_again() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        let before = home.collect(&cache);
+
+        let swap = |path: &Path, from: &str, to: &str| {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(content.contains(from), "{content}");
+            rewrite_keeping_length_and_mtime(path, &content.replace(from, to));
+        };
+        swap(&home.claude_path("a.jsonl"), r#""output_tokens":11"#, r#""output_tokens":99"#);
+        swap(&home.pi_path(), r#""output":31"#, r#""output":99"#);
+        swap(&home.codex_path("one.jsonl"), r#""output_tokens":41"#, r#""output_tokens":99"#);
+
+        let cached = home.collect(&cache);
+        assert_eq!(json(&cached), json(&before), "the cached counts, not the new file content");
+        let cold = home.collect(&cache::UsageCache::default());
+        assert_eq!(agent_totals(&cold)[0].1, 79 - 11 + 99, "the files did change");
+
+        for path in [home.claude_path("a.jsonl"), home.pi_path(), home.codex_path("one.jsonl")] {
+            touch_later(&path);
+        }
+        let reread = home.collect(&cache);
+        assert_eq!(agent_totals(&reread), agent_totals(&cold), "a new modified time is read again");
+        assert_eq!((cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed()), (3, 2, 3));
+    }
+
+    /// An appended file is read again in full and its new entries show; its
+    /// dedupe stays per file (a repeated request id still counts once).
+    #[test]
+    fn an_appended_file_is_read_again() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        home.collect(&cache);
+
+        let path = home.claude_path("b.jsonl");
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        let first_line = content.lines().next().unwrap().to_string();
+        let appended = first_line.replace(r#""requestId":"r1""#, r#""requestId":"r9""#).replace(r#""output_tokens":21"#, r#""output_tokens":30"#);
+        content.push_str(&format!("{appended}\n{first_line}\n"));
+        std::fs::write(&path, content).unwrap();
+
+        let warm = home.collect(&cache);
+        assert_eq!(agent_totals(&warm)[0], (6, 79 + 30), "the new entry counts, the repeated r1 does not");
+        assert_eq!(json(&warm), home.cold());
+        assert_eq!(cache.claude.parsed(), 3, "only the appended file is read again");
+    }
+
+    /// A deleted file's entries leave the agent's own data and the cache.
+    #[test]
+    fn a_deleted_file_drops_out_of_the_cache() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        home.collect(&cache);
+        std::fs::remove_file(home.claude_path("a.jsonl")).unwrap();
+        std::fs::remove_file(home.codex_path("two.jsonl")).unwrap();
+
+        let warm = home.collect(&cache);
+        assert_eq!(agent_totals(&warm)[0], (2, 43), "only b.jsonl is left");
+        assert_eq!(agent_totals(&warm)[1], (1, 41));
+        assert_eq!(json(&warm), home.cold());
+        assert_eq!((cache.claude.len(), cache.codex.len(), cache.pi.len()), (1, 1, 1));
+    }
+
+    /// Two collects at once over one cache give the same snapshot, equal to
+    /// a cold one.
+    #[test]
+    fn concurrent_collects_over_one_cache_agree() {
+        let home = CacheHome::new();
+        let cold = home.cold();
+        for _ in 0..5 {
+            let cache = cache::UsageCache::default();
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<serde_json::Value> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let (barrier, cache, home) = (&barrier, &cache, &home);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            json(&home.collect(cache))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(results[0], cold);
+            assert_eq!(results[1], cold);
+            assert_eq!(json(&home.collect(&cache)), cold, "and the warm collect after them");
+        }
     }
 
     /// Without a ledger path the collect only reads: the parity harness
@@ -1370,7 +1902,7 @@ mod tests {
     fn parity_this_month_against_the_real_home() {
         let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
         let overrides = pricing::PriceOverrides::default();
-        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None);
+        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None, &ProjectAliases::default(), &cache::UsageCache::default());
 
         println!("\n=== orbitbar Rust reader parity (ThisMonth) ===");
         for agent in &snapshot.agents {
@@ -1384,6 +1916,38 @@ mod tests {
                 agent.projects.len()
             );
             println!("          detail: {}", agent.detail);
+        }
+    }
+
+    /// Times cold and warm collects against the real home, ledger `None`,
+    /// in one process: the first ThisMonth collect reads every file, the
+    /// next ones only what changed. Debug timings; the ratio is the point.
+    /// Run with: `cargo test --lib -- --ignored timing --nocapture`
+    #[test]
+    #[ignore]
+    fn timing_cold_and_warm_collects_against_the_real_home() {
+        let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
+        let overrides = pricing::PriceOverrides::default();
+        let cache = cache::UsageCache::default();
+        let run = |label: &str, window: TimeWindow, cache: &cache::UsageCache| {
+            let started = std::time::Instant::now();
+            let snapshot = collect_usage(window, &paths, Local::now(), &overrides, None, &ProjectAliases::default(), cache);
+            let totals: Vec<u64> = snapshot.agents.iter().map(|a| a.totals.output_tokens).collect();
+            println!("{label:28} {:>8.2} s  output per agent {totals:?}", started.elapsed().as_secs_f64());
+            json(&snapshot)
+        };
+        println!("
+=== orbitbar usage cache timing ===");
+        let cold_today = run("cold Today (fresh cache)", TimeWindow::Today, &cache::UsageCache::default());
+        let cold = run("cold ThisMonth", TimeWindow::ThisMonth, &cache);
+        let warm = run("warm ThisMonth", TimeWindow::ThisMonth, &cache);
+        let warm_today = run("warm Today", TimeWindow::Today, &cache);
+        // Agents may write between the runs; compare only when they did not.
+        if warm["agents"] != cold["agents"] {
+            println!("note: ThisMonth changed between the cold and warm runs (an agent is writing)");
+        }
+        if warm_today["agents"] != cold_today["agents"] {
+            println!("note: Today changed between the cold and warm runs (an agent is writing)");
         }
     }
 }

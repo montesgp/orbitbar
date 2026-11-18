@@ -50,21 +50,57 @@ fn save_config(app: tauri::AppHandle, cfg: config::AppConfig) -> Result<(), Stri
 /// `usage-ledger.json` in the same folder is Orbitbar's own history of the
 /// claude and pi daily totals (see `usage::ledger`); it is the only file this
 /// writes, never one of the agents' files.
+///
+/// `projectAliases` is read from `config.json` on every call too (read-only,
+/// see `config::read_project_aliases`), so an edited alias applies on the
+/// next refresh.
+///
+/// The agents' session files go through the app's file cache
+/// (`usage::cache::UsageCache::global`), so only the files that changed since
+/// the last call are read again.
 #[tauri::command]
 async fn get_usage(app: tauri::AppHandle, window: usage::TimeWindow) -> Result<usage::UsageSnapshot, String> {
     let config_dir = config::config_dir(&app)?;
-    let pricing_path = config_dir.join("pricing.json");
-    let ledger_path = config_dir.join(usage::ledger::FILE_NAME);
-    tauri::async_runtime::spawn_blocking(move || {
-        let paths = usage::resolve_paths(None).ok_or_else(|| "cannot resolve home directory".to_string())?;
-        let (overrides, pricing_warning) = usage::pricing::load_overrides(&pricing_path);
-        let mut snapshot =
-            usage::collect_usage(window, &paths, chrono::Local::now(), &overrides, Some(&ledger_path));
-        snapshot.pricing_warning = pricing_warning;
-        Ok(snapshot)
-    })
-    .await
-    .map_err(|e| format!("usage task panicked: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || collect_snapshot(&config_dir, window))
+        .await
+        .map_err(|e| format!("usage task panicked: {e}"))?
+}
+
+/// One usage snapshot as `get_usage` returns it, with `pricing.json`,
+/// `projectAliases` and the ledger from `config_dir`. Blocking.
+fn collect_snapshot(config_dir: &std::path::Path, window: usage::TimeWindow) -> Result<usage::UsageSnapshot, String> {
+    let paths = usage::resolve_paths(None).ok_or_else(|| "cannot resolve home directory".to_string())?;
+    let (overrides, pricing_warning) = usage::pricing::load_overrides(&config_dir.join("pricing.json"));
+    let aliases = usage::ProjectAliases::new(&config::read_project_aliases(&config_dir.join("config.json")));
+    let mut snapshot = usage::collect_usage(
+        window,
+        &paths,
+        chrono::Local::now(),
+        &overrides,
+        Some(&config_dir.join(usage::ledger::FILE_NAME)),
+        &aliases,
+        usage::cache::UsageCache::global(),
+    );
+    snapshot.pricing_warning = pricing_warning;
+    Ok(snapshot)
+}
+
+/// How long after launch the usage cache is warmed up.
+const USAGE_WARM_UP_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs one `get_usage`-equivalent collect for `Today` in the background
+/// shortly after launch, so the first panel open finds the session files
+/// already in the cache. Debug and release builds alike; a failure is only
+/// logged, the panel's own call reads everything it needs anyway.
+fn start_usage_warm_up(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(USAGE_WARM_UP_DELAY);
+        let started = std::time::Instant::now();
+        match config::config_dir(&app).and_then(|dir| collect_snapshot(&dir, usage::TimeWindow::Today)) {
+            Ok(_) => eprintln!("orbitbar: usage cache warmed up in {:.1} s", started.elapsed().as_secs_f64()),
+            Err(e) => eprintln!("orbitbar: usage warm-up failed: {e}"),
+        }
+    });
 }
 
 /// Full path to config.json, for the context menu's
@@ -433,6 +469,7 @@ pub fn run() {
             sync_autostart(app.handle(), &cfg);
             #[cfg(desktop)]
             start_update_checks(app.handle().clone());
+            start_usage_warm_up(app.handle().clone());
 
             // Start in the persisted state: collapsed is a small chevron tab,
             // expanded is the full launcher. The bar goes where it was last

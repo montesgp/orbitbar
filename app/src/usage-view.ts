@@ -132,10 +132,12 @@ export function statusLabel(status: AgentStatus): string {
 
 export interface ProjectLineViewModel {
   name: string;
-  /** Full normalized path (see `normalize_project_path` in usage/mod.rs),
-   * always available as the row's tooltip so a disambiguated or truncated
-   * name never loses the real location. */
+  /** Full normalized path (see `normalize_project_path` in usage/mod.rs);
+   * empty for the "Outside projects" row. */
   path: string;
+  /** The row's tooltip: the path, so a disambiguated or truncated name never
+   * loses the real location, or what "Outside projects" holds. */
+  tooltip: string;
   output: string;
   cost: string;
 }
@@ -153,6 +155,16 @@ function parentSegment(path: string): string | null {
   return segments[segments.length - 2];
 }
 
+/** The row of the usage that ran outside any repository: the Rust side
+ * keys it with an empty path (`OUTSIDE_PROJECTS` in usage/mod.rs). */
+export const OUTSIDE_PROJECTS_NAME = "Outside projects";
+export const OUTSIDE_PROJECTS_TOOLTIP =
+  "Sessions run outside any Git repository (home folder, temp folders, other folders)";
+
+function isOutsideProjects(project: ProjectUsage): boolean {
+  return project.path === "";
+}
+
 /**
  * Two sibling checkouts can share a leaf folder name (e.g. two
  * "src-tauri" projects) and land side by side in the same agent's project
@@ -161,12 +173,17 @@ function parentSegment(path: string): string | null {
  * stay distinct (e.g. "app/src-tauri" vs "tools/src-tauri"); a name that
  * is unique in the list is left alone. Collisions are only checked within
  * `projects` (the rows actually shown: the top 5, or every project when the
- * section is expanded), since that is what the user sees together.
+ * section is expanded), since that is what the user sees together. The
+ * "Outside projects" row has no path; it is always named
+ * `OUTSIDE_PROJECTS_NAME` and never takes part in a collision.
  */
 export function disambiguateProjectNames(projects: ProjectUsage[]): string[] {
   const counts = new Map<string, number>();
-  for (const p of projects) counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
+  for (const p of projects) {
+    if (!isOutsideProjects(p)) counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
+  }
   return projects.map((p) => {
+    if (isOutsideProjects(p)) return OUTSIDE_PROJECTS_NAME;
     if ((counts.get(p.name) ?? 0) <= 1) return p.name;
     const parent = parentSegment(p.path);
     return parent ? `${parent}/${p.name}` : p.name;
@@ -243,6 +260,7 @@ export function buildAgentSection(report: AgentUsageReport, expanded = false): A
           return top.map((p, i) => ({
             name: names[i],
             path: p.path,
+            tooltip: isOutsideProjects(p) ? OUTSIDE_PROJECTS_TOOLTIP : p.path,
             output: formatCompactNumber(p.totals.outputTokens),
             cost: formatCost(p.totals.cost, p.totals.costBasis),
           }));

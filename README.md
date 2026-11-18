@@ -208,6 +208,7 @@ Orbitbar creates `config.json` with defaults on first launch (paths per OS in
 | `autoStart` | Start Orbitbar at login (on by default; release builds only). The menu's **Start with system** entry changes it for you: its check mark shows the real OS registration, and selecting it updates the OS entry and this field. |
 | `autoUpdate` | Check this repository's GitHub Releases for a signed update and install it (on by default; release builds only, and on Linux only the AppImage). The menu's **Automatic updates** entry changes it for you. See [Updating](#updating). |
 | `showExamples` | Show the example cells (items flagged `"example": true`). Off by default. The menu's **Show example action** entry changes it for you. |
+| `projectAliases` | Usage-panel projects shown under another project, for example a deleted worktree under its main repository. Empty by default. See [Project aliases](#project-aliases). |
 | `items` | The cells on the bar, each with `id`, `glyph`, `label`, `tooltip` and `action`, and optionally `"example": true`. |
 
 Item actions:
@@ -271,6 +272,35 @@ you already have is not rewritten, so add the `github` item there by hand
 If `config.json` cannot be parsed, Orbitbar renames it to
 `config.json.invalid` and starts on the defaults.
 
+### Project aliases
+
+`projectAliases` maps a project path to the project it should be counted
+under in the usage panel. Use it to join the rows of a worktree or a renamed
+folder with the repository they belong to:
+
+```json
+"projectAliases": {
+  "R:\\repositories\\personal\\sortea-wt": "R:\\repositories\\personal\\sortea"
+}
+```
+
+On macOS and Linux:
+
+```json
+"projectAliases": {
+  "/Users/me/code/sortea-wt": "/Users/me/code/sortea"
+}
+```
+
+A project whose path is the alias path, or a folder inside it, is shown under
+the target path, and its tokens, entries and cost are added to that row.
+Paths match by whole folder names (`sortea-wt` never matches `sortea-wt2`),
+ignoring letter case on Windows only, and the longest matching alias wins.
+Neither path has to exist. Aliases apply only to what the panel shows: the
+history in `usage-ledger.json` keeps the original paths, so adding, changing or
+removing an alias applies to the whole history at the next refresh. The
+**Outside projects** row is never aliased.
+
 ### Custom model prices
 
 Built-in prices live in `app/src-tauri/src/usage/pricing.rs`, one row per
@@ -301,11 +331,12 @@ project that Claude has no usage for, and its panel says how many it left
 out; turns from every other Pi provider always count.
 
 Usage is grouped by project: the repository a session ran in. Runs that are
-not part of a project are not counted, neither in the project list nor in the
-agent totals: sessions started in your operating system's temporary folder
-(for example a tool that spawns short-lived agent runs there), and sessions
-started in a folder that is not inside any Git repository (such as your home
-folder). A project whose folder was renamed or deleted still appears, as one
+not part of a project are counted in the agent totals and shown together in
+one row, **Outside projects**: sessions started in your operating system's
+temporary folder (for example a tool that spawns short-lived agent runs
+there), sessions started in a folder that is not inside any Git repository
+(such as your home folder), and sessions that recorded no folder. It is
+sorted with the other rows by output tokens. A project whose folder was renamed or deleted still appears, as one
 row named after the folder that is gone. A repository reached through two
 paths (for example through a Windows junction or a symbolic link) is one
 project, named by the path the link points to.
@@ -317,9 +348,9 @@ projects** under the list expands it to every project in the window.
 
 Claude Code deletes session files older than its `cleanupPeriodDays` setting
 (30 days unless you change it in `~/.claude/settings.json`), so their usage
-would drop out of the panel. Orbitbar keeps daily totals per project for
-Claude Code and Pi in `usage-ledger.json`, next to `config.json`, and keeps
-them for 365 days. It holds token counts and the model only; costs are
+would drop out of the panel. Orbitbar keeps daily totals per project and
+model for Claude Code and Pi in `usage-ledger.json`, next to `config.json`,
+and keeps them for 365 days. It holds token counts and the model only; costs are
 computed when the panel opens, so `pricing.json` still applies. Codex and
 OpenCode keep their whole history in their own stores, so they are not in it.
 

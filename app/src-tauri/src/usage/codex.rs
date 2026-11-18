@@ -11,13 +11,14 @@
 //!
 //! Same windowing rule as the claude reader: the month total and the
 //! per-project bucket are both gated by the session's last timestamp, so an
-//! out-of-window session never leaks into either. Sessions outside any project (a cwd under the OS temp dir, or an existing
-//! folder that is not inside a repository; see `resolve_project_root`) are
-//! left out of the totals and the project rows alike, so that invariant holds.
+//! out-of-window session never leaks into either. Sessions outside any
+//! project (a cwd under the OS temp dir, an existing folder that is not inside
+//! a repository, or no cwd; see `project_key`) count in the "Outside
+//! projects" row, so the rows still sum to the totals.
 
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_display_name, resolve_project_root,
-    AgentUsageReport, CostBasis, ProjectRootCache, ProjectUsage, UsageTotals,
+    cache::FileCache, find_jsonl_files, normalize_project_path, pricing, project_display_name, project_key, AgentUsageReport, CostBasis,
+    ProjectAliases, ProjectRootCache, ProjectUsage, UsageTotals,
 };
 use chrono::{DateTime, Local};
 use serde_json::Value;
@@ -41,13 +42,53 @@ impl Bucket {
 /// pricing against `overrides` layered on top of the built-in table.
 /// Per-project totals are keyed by resolved project root (see
 /// `resolve_project_root`), not the raw session cwd, so two cwds inside the
-/// same repository merge into one row.
+/// same repository merge into one row. Each project is priced at its own
+/// model, then reported under its alias (see `ProjectAliases::merge_rows`).
+/// Reads every file: `collect_usage` calls [`read_usage_cached`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_usage(
     root: &Path,
     start: DateTime<Local>,
     end: DateTime<Local>,
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
+    aliases: &ProjectAliases,
+) -> AgentUsageReport {
+    read_usage_cached(root, start, end, overrides, root_cache, aliases, &FileCache::default())
+}
+
+/// One session file's last usage record, before project-root resolution and
+/// the window: what `usage::cache` keeps per file. `session` is `None` for a
+/// file with no usage record.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileUsage {
+    session: Option<Session>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Session {
+    /// The last usage record's timestamp, or the file's modified time.
+    stamp: DateTime<Local>,
+    /// Normalized raw cwd; `""` when the file names none.
+    cwd: String,
+    model: String,
+    input: u64,
+    output: u64,
+    cached: u64,
+    cache_write: u64,
+    reasoning: u64,
+}
+
+/// [`read_usage`], reading again only the files that changed since the last
+/// call with the same `cache` (see `usage::cache`).
+pub fn read_usage_cached(
+    root: &Path,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+    overrides: &pricing::PriceOverrides,
+    root_cache: &mut ProjectRootCache,
+    aliases: &ProjectAliases,
+    cache: &FileCache<FileUsage>,
 ) -> AgentUsageReport {
     if !root.exists() {
         return AgentUsageReport::not_installed(AGENT, format!("missing directory: {}", root.display()));
@@ -60,107 +101,99 @@ pub fn read_usage(
 
     let mut month = Bucket::new();
     let mut projects: std::collections::HashMap<String, Bucket> = std::collections::HashMap::new();
-    let mut files_scanned = 0u64;
-    let mut no_cwd = 0u64;
-    // Sessions in the window whose cwd is excluded (see `resolve_project_root`).
-    // They are left out of the month totals AND the per-project rows, so the
-    // per-project split still sums to the totals. A session with no cwd at
-    // all cannot be judged, so it stays in the totals (counted in `no_cwd`).
-    let mut excluded = 0u64;
+    let parsed = cache.load(root, &files, parse_file);
+    let files_scanned = parsed.len() as u64;
 
-    for file in &files {
-        let Ok(handle) = std::fs::File::open(file) else { continue };
-        files_scanned += 1;
-        let reader = BufReader::new(handle);
-
-        let mut last_usage: Option<Value> = None;
-        let mut last_ts: Option<DateTime<Local>> = None;
-        let mut file_cwd = String::new();
-        let mut file_model = String::new();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            if !line.contains("token_usage") && !line.contains("\"cwd\"") && !line.contains("\"model\"") {
-                continue;
-            }
-            // A malformed line is skipped, never fatal to the file.
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-            let Some(payload) = entry.get("payload") else { continue };
-
-            if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
-                file_cwd = normalize_project_path(cwd);
-            }
-            if let Some(model) = payload.get("model").and_then(Value::as_str) {
-                let model = model.trim();
-                if !model.is_empty() && !model.starts_with('<') {
-                    file_model = model.to_string();
-                }
-            }
-
-            let usage = payload
-                .get("turn_token_usage")
-                .or_else(|| payload.get("info").and_then(|i| i.get("total_token_usage")))
-                .or_else(|| payload.get("usage"));
-            let Some(usage) = usage else { continue };
-
-            last_usage = Some(usage.clone());
-            last_ts = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local));
-        }
-
-        let Some(usage) = last_usage else { continue };
-
-        let stamp = match last_ts {
-            Some(ts) => ts,
-            None => {
-                let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
-                match mtime {
-                    Some(mtime) => DateTime::<Local>::from(mtime),
-                    None => continue,
-                }
-            }
-        };
-        if stamp < start || stamp >= end {
+    for file in &parsed {
+        let Some(s) = &file.session else { continue };
+        if s.stamp < start || s.stamp >= end {
             continue;
         }
-
-        let input = get_u64(&usage, "input_tokens");
-        let output = get_u64(&usage, "output_tokens");
-        let cached = get_u64(&usage, "cached_input_tokens");
-        let cache_write = get_u64(&usage, "cache_write_input_tokens");
-        let reasoning = get_u64(&usage, "reasoning_output_tokens");
-        let model = if file_model.is_empty() { None } else { Some(file_model.as_str()) };
-
-        let project_key = if file_cwd.is_empty() {
-            None
-        } else {
-            match resolve_project_root(&file_cwd, root_cache) {
-                Some(root) => Some(root),
-                None => {
-                    excluded += 1;
-                    continue;
-                }
-            }
-        };
-
-        add_entry(&mut month, input, output, cached, cache_write, reasoning, model);
-
-        match project_key {
-            Some(project_key) => {
-                let bucket = projects.entry(project_key).or_insert_with(Bucket::new);
-                add_entry(bucket, input, output, cached, cache_write, reasoning, model);
-            }
-            None => no_cwd += 1,
-        }
+        let model = if s.model.is_empty() { None } else { Some(s.model.as_str()) };
+        add_entry(&mut month, s.input, s.output, s.cached, s.cache_write, s.reasoning, model);
+        let bucket = projects.entry(project_key(&s.cwd, root_cache)).or_insert_with(Bucket::new);
+        add_entry(bucket, s.input, s.output, s.cached, s.cache_write, s.reasoning, model);
     }
 
     if files_scanned == 0 {
         return AgentUsageReport::error(AGENT, format!("no session files readable under {}", root.display()));
     }
+    report(month, projects, files_scanned, overrides, aliases)
+}
 
+/// Reads one session file; `None` when it cannot be opened.
+fn parse_file(file: &Path) -> Option<FileUsage> {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+
+    let mut last_usage: Option<Value> = None;
+    let mut last_ts: Option<DateTime<Local>> = None;
+    let mut file_cwd = String::new();
+    let mut file_model = String::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if !line.contains("token_usage") && !line.contains("\"cwd\"") && !line.contains("\"model\"") {
+            continue;
+        }
+        // A malformed line is skipped, never fatal to the file.
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+        let Some(payload) = entry.get("payload") else { continue };
+
+        if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+            file_cwd = normalize_project_path(cwd);
+        }
+        if let Some(model) = payload.get("model").and_then(Value::as_str) {
+            let model = model.trim();
+            if !model.is_empty() && !model.starts_with('<') {
+                file_model = model.to_string();
+            }
+        }
+
+        let usage = payload
+            .get("turn_token_usage")
+            .or_else(|| payload.get("info").and_then(|i| i.get("total_token_usage")))
+            .or_else(|| payload.get("usage"));
+        let Some(usage) = usage else { continue };
+
+        last_usage = Some(usage.clone());
+        last_ts = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local));
+    }
+
+    let Some(usage) = last_usage else { return Some(FileUsage::default()) };
+    let stamp = match last_ts {
+        Some(ts) => ts,
+        None => match std::fs::metadata(file).and_then(|m| m.modified()) {
+            Ok(mtime) => DateTime::<Local>::from(mtime),
+            Err(_) => return Some(FileUsage::default()),
+        },
+    };
+    Some(FileUsage {
+        session: Some(Session {
+            stamp,
+            cwd: file_cwd,
+            model: file_model,
+            input: get_u64(&usage, "input_tokens"),
+            output: get_u64(&usage, "output_tokens"),
+            cached: get_u64(&usage, "cached_input_tokens"),
+            cache_write: get_u64(&usage, "cache_write_input_tokens"),
+            reasoning: get_u64(&usage, "reasoning_output_tokens"),
+        }),
+    })
+}
+
+/// Prices the window's totals and project rows and builds the report.
+fn report(
+    month: Bucket,
+    projects: std::collections::HashMap<String, Bucket>,
+    files_scanned: u64,
+    overrides: &pricing::PriceOverrides,
+    aliases: &ProjectAliases,
+) -> AgentUsageReport {
     let mut month_totals = month.totals;
     if month_totals.entries > 0 {
         let uncached = month_totals.input_tokens.saturating_sub(month_totals.cache_read_tokens);
@@ -204,13 +237,8 @@ pub fn read_usage(
         });
     }
 
-    let mut detail = format!("{} projects - {} files", projects_out.len(), files_scanned);
-    if no_cwd > 0 {
-        detail.push_str(&format!(" - {no_cwd} sessions without a cwd"));
-    }
-    if excluded > 0 {
-        detail.push_str(&format!(" - {excluded} sessions outside any project not counted"));
-    }
+    let projects_out = aliases.merge_rows(projects_out);
+    let detail = format!("{} projects - {} files", projects_out.len(), files_scanned);
     AgentUsageReport::ok(AGENT, month_totals, projects_out, detail)
 }
 
@@ -266,7 +294,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nope");
         let (start, end) = window();
-        let report = read_usage(&missing, start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(&missing, start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::NotInstalled);
     }
 
@@ -282,7 +310,7 @@ mod tests {
         fs::write(dir.path().join("session.jsonl"), content).unwrap();
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::Ok);
         assert_eq!(report.totals.entries, 1, "one session file must contribute exactly one record");
         assert_eq!(report.totals.input_tokens, 1_356_488, "the LAST record's cumulative total must win, not a sum");
@@ -304,7 +332,7 @@ mod tests {
         .unwrap();
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.totals.entries, 1);
         assert_eq!(report.totals.output_tokens, 50);
     }
@@ -319,7 +347,7 @@ mod tests {
         fs::write(dir.path().join("session.jsonl"), content).unwrap();
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::Ok);
         assert_eq!(report.totals.entries, 1);
     }
@@ -361,6 +389,7 @@ mod tests {
                 temp_dirs: Vec::new(),
                 home: Some(dir.path().to_path_buf()),
             }),
+            &ProjectAliases::default(),
         );
         assert_eq!(report.projects.len(), 1, "both cwds share the same repo root");
         assert_eq!(report.projects[0].totals.output_tokens, 30, "tokens from both cwds must sum");
@@ -374,7 +403,7 @@ mod tests {
         fs::write(dir.path().join("session.jsonl"), content).unwrap();
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.totals.cost, None);
     }
 
@@ -382,7 +411,7 @@ mod tests {
     fn empty_directory_with_no_session_files_is_ok_with_empty_totals() {
         let dir = tempdir().unwrap();
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::Ok);
         assert_eq!(report.totals.entries, 0);
     }
@@ -397,13 +426,52 @@ mod tests {
         .unwrap();
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert!(report.totals.cost.is_some());
         assert_eq!(
             report.totals.cost_basis,
             Some(CostBasis::ApiEquivalent),
             "codex money is an API-equivalent estimate, never a reported bill"
         );
+    }
+
+    /// An alias merges codex rows after each was priced at its own model.
+    #[test]
+    fn an_alias_merges_two_project_rows() {
+        use crate::usage::{resolve_project_root, RootPolicy};
+        let dir = tempdir().unwrap();
+        let cache = || {
+            ProjectRootCache::with_policy(RootPolicy { temp_dirs: Vec::new(), home: Some(dir.path().to_path_buf()) })
+        };
+        let repo = |name: &str| {
+            let repo = dir.path().join(name);
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            let cwd = repo.to_string_lossy().replace('\\', "/");
+            let key = resolve_project_root(&cwd, &mut cache()).expect("a repository");
+            (cwd, key)
+        };
+        let ((main, main_key), (wt, wt_key)) = (repo("sortea"), repo("sortea-wt"));
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("a.jsonl"), record("2026-09-15T10:00:00Z", &main, 100, 10)).unwrap();
+        fs::write(sessions.join("b.jsonl"), record("2026-09-15T10:00:00Z", &wt, 100, 20)).unwrap();
+        let (start, end) = window();
+        let overrides = pricing::PriceOverrides::default();
+        let read = |aliases: &ProjectAliases| read_usage(&sessions, start, end, &overrides, &mut cache(), aliases);
+
+        let apart = read(&ProjectAliases::default());
+        assert_eq!(apart.projects.len(), 2);
+        let map = std::collections::BTreeMap::from([(wt_key, main_key.clone())]);
+        let merged = read(&ProjectAliases::new(&map));
+        assert_eq!(merged.projects.len(), 1);
+        assert_eq!(merged.projects[0].name, "sortea");
+        assert_eq!(merged.projects[0].path, main_key);
+        assert_eq!(merged.projects[0].totals.output_tokens, 30);
+        assert_eq!(merged.projects[0].totals.entries, 2);
+        let sum: f64 = apart.projects.iter().filter_map(|p| p.totals.cost).sum();
+        assert_eq!(merged.projects[0].totals.cost, Some((sum * 10_000.0).round() / 10_000.0));
+        assert_eq!(merged.totals, apart.totals, "aliases never change the totals");
+        assert!(merged.detail.starts_with("1 projects"), "{}", merged.detail);
     }
 
     #[test]
@@ -429,7 +497,7 @@ mod tests {
         let overrides = pricing::PriceOverrides { models };
 
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &overrides, &mut ProjectRootCache::new());
+        let report = read_usage(dir.path(), start, end, &overrides, &mut ProjectRootCache::new(), &ProjectAliases::default());
         // record() also carries a fixed 1000 cached + 100 cache-write tokens
         // priced at the override's default multipliers (0.1x / 1.25x input),
         // so the total is not an even 2.0 but is far from the built-in
@@ -437,12 +505,12 @@ mod tests {
         assert_eq!(report.totals.cost, Some(1.9992));
     }
 
-    /// Sessions whose cwd is scratch (a review subprocess under the temp dir)
-    /// or a folder outside any repository are not counted anywhere: not in the
-    /// project rows and not in the totals, so the split still sums to the
-    /// totals. A session with no cwd cannot be judged and stays in the totals.
+    /// Sessions whose cwd is scratch (a review subprocess under the temp dir),
+    /// a folder outside any repository, or missing all count in the totals and
+    /// in one "Outside projects" row with an empty path, so the rows still sum
+    /// to the totals.
     #[test]
-    fn sessions_outside_any_project_are_left_out_of_totals_and_rows() {
+    fn sessions_outside_any_project_count_in_the_outside_projects_row() {
         use crate::usage::RootPolicy;
         let dir = tempdir().unwrap();
         let temp = dir.path().join("Temp");
@@ -465,13 +533,19 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
         });
         let (start, end) = window();
-        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut cache);
+        let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut cache, &ProjectAliases::default());
 
-        assert_eq!(report.totals.entries, 2, "the kept session and the one with no cwd");
-        assert_eq!(report.totals.output_tokens, 15);
-        assert_eq!(report.projects.len(), 1);
-        assert_eq!(report.projects[0].name, "kept-app");
-        assert_eq!(report.projects[0].totals.output_tokens, 10);
-        assert!(report.detail.contains("2 sessions outside any project not counted"), "{}", report.detail);
+        assert_eq!(report.totals.entries, 4, "every session counts");
+        assert_eq!(report.totals.output_tokens, 1215);
+        assert_eq!(report.projects.len(), 2);
+        let outside = &report.projects[0];
+        assert_eq!((outside.name.as_str(), outside.path.as_str()), ("Outside projects", ""), "sorted by output");
+        assert_eq!(outside.totals.output_tokens, 1205);
+        assert_eq!(outside.totals.entries, 3);
+        assert!(outside.totals.cost.is_some());
+        assert_eq!(report.projects[1].name, "kept-app");
+        assert_eq!(report.projects.iter().map(|p| p.totals.entries).sum::<u64>(), report.totals.entries);
+        assert_eq!(report.projects.iter().map(|p| p.totals.output_tokens).sum::<u64>(), report.totals.output_tokens);
+        assert!(!report.detail.contains("not counted"), "{}", report.detail);
     }
 }

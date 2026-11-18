@@ -9,6 +9,7 @@
 //! below, so end users always get an editable config without installing tools.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
@@ -42,6 +43,11 @@ pub struct AppConfig {
     /// Omitted from config.json while unset, so an untouched file stays clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// Project paths reported under another project in the usage panel, for
+    /// example a deleted worktree under its main repository (see
+    /// `usage::ProjectAliases`). Empty by default. Always written, even when
+    /// empty, so the frontend's in-place reload replaces a removed map.
+    pub project_aliases: BTreeMap<String, String>,
     pub items: Vec<Item>,
 }
 
@@ -64,6 +70,7 @@ impl Default for AppConfig {
             auto_update: true,
             show_examples: false,
             position: None,
+            project_aliases: BTreeMap::new(),
             items: default_items(),
         }
     }
@@ -257,6 +264,17 @@ pub fn read_auto_update(path: &std::path::Path) -> Option<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(AppConfig::default().auto_update),
         Err(_) => None,
     }
+}
+
+/// `projectAliases` from the config at `path`, for `get_usage`. Read-only
+/// like [`read_auto_update`]: a panel refresh must never reset a config the
+/// user is editing. A missing, unreadable or invalid file gives no aliases.
+pub fn read_project_aliases(path: &std::path::Path) -> BTreeMap<String, String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AppConfig>(strip_bom(&raw)).ok())
+        .map(|cfg| cfg.project_aliases)
+        .unwrap_or_default()
 }
 
 pub fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -520,6 +538,53 @@ mod tests {
     /// Automatic updates are on by default, and a config written before
     /// `autoUpdate` existed gets true too, so an upgraded install keeps
     /// receiving updates without the user opting in.
+    /// `projectAliases` is empty by default and for a config written before it
+    /// existed, and it is always written, so the frontend's in-place reload
+    /// (`Object.assign`) replaces a stale copy when the user removes it.
+    #[test]
+    fn project_aliases_default_to_empty_and_a_config_without_them_loads() {
+        assert!(AppConfig::default().project_aliases.is_empty());
+        let cfg: AppConfig = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(cfg.project_aliases.is_empty());
+        let json: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["projectAliases"], serde_json::json!({}));
+    }
+
+    /// The frontend saves the whole config object it loaded (a menu toggle
+    /// changes one field): the aliases in it must survive that save.
+    #[test]
+    fn project_aliases_survive_a_menu_toggle_save() {
+        let loaded = r#"{"theme":"dark","projectAliases":{"R:\\repositories\\personal\\sortea-wt":"R:\\repositories\\personal\\sortea","/home/me/a-wt":"/home/me/a"}}"#;
+        let mut cfg: AppConfig = serde_json::from_str(loaded).unwrap();
+        cfg.auto_update = false;
+        let saved = serde_json::to_string(&cfg).unwrap();
+        let again: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(again.project_aliases.len(), 2);
+        assert_eq!(again.project_aliases[r"R:\repositories\personal\sortea-wt"], r"R:\repositories\personal\sortea");
+        assert_eq!(again.project_aliases["/home/me/a-wt"], "/home/me/a");
+        assert!(!again.auto_update);
+    }
+
+    /// `get_usage` reads the aliases without ever writing the file: a
+    /// half-edited config is not reset by a panel refresh. Anything that
+    /// cannot be read gives no aliases.
+    #[test]
+    fn the_usage_panel_reads_project_aliases_without_writing_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert!(read_project_aliases(&path).is_empty(), "missing file");
+        assert!(!path.exists(), "a missing file is not created");
+
+        std::fs::write(&path, "\u{feff}{ \"projectAliases\": { \"/a-wt\": \"/a\" } }").unwrap();
+        assert_eq!(read_project_aliases(&path).get("/a-wt").map(String::as_str), Some("/a"), "a BOM is fine");
+
+        let broken = r#"{ "projectAliases": { "/a-wt": "#;
+        std::fs::write(&path, broken).unwrap();
+        assert!(read_project_aliases(&path).is_empty(), "invalid JSON");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "left byte-for-byte");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no .invalid copy, no new file");
+    }
+
     /// The background update check reads `autoUpdate` without ever writing
     /// the file: a config the user is mid-way through editing must not be
     /// renamed to `.invalid` and reset by a thread they never triggered.
