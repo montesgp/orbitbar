@@ -12,7 +12,7 @@
 //! with no cwd: it counts like any project and becomes the "Outside
 //! projects" row.
 
-use crate::usage::{project_display_name, CostBasis, ProjectUsage, UsageTotals};
+use crate::usage::{project_display_name, CostBasis, ProjectAliases, ProjectUsage, UsageTotals};
 use chrono::NaiveDate;
 use std::collections::BTreeMap;
 
@@ -151,13 +151,16 @@ impl DailyBuckets {
     /// each at its own rate. A total's cost is `None` only when no bucket in
     /// it could be priced; `cost_basis` is `basis` exactly when `cost` is set.
     /// A project row's model is the named model with the most output tokens
-    /// in the window; on a tie the one used last, then the greater name.
+    /// in the window; on a tie the one used last, then the greater name. A
+    /// project key is reported under its alias (see `ProjectAliases`): the
+    /// keys of one alias target fold into one row.
     pub fn fold(
         &self,
         start: NaiveDate,
         end: NaiveDate,
         price: impl Fn(&DailyCounters) -> Option<f64>,
         basis: CostBasis,
+        aliases: &ProjectAliases,
     ) -> WindowFold {
         let mut totals = Cost::default();
         let mut projects: BTreeMap<&str, (Cost, ModelOutputs)> = BTreeMap::new();
@@ -168,7 +171,8 @@ impl DailyBuckets {
             for ((date, project, model), counters) in self.buckets.range(range) {
                 let amount = price(counters);
                 totals.add(counters, amount);
-                let (row, models) = projects.entry(project.as_str()).or_default();
+                // Aliased keys share one row, its model picked over all of them.
+                let (row, models) = projects.entry(aliases.resolve(project)).or_default();
                 row.add(counters, amount);
                 if !model.is_empty() {
                     // Dates ascend, so the last date seen is the latest.
@@ -320,7 +324,7 @@ mod tests {
         buckets.add(day(3), "p", &entry("priced", 20));
         buckets.add(day(4), "p", &entry("priced", 1000)); // end, excluded
 
-        let fold = buckets.fold(day(2), day(4), price, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(2), day(4), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.totals.output_tokens, 30);
         assert_eq!(fold.totals.input_tokens, 20);
         assert_eq!(fold.totals.cache_read_tokens, 2);
@@ -342,7 +346,7 @@ mod tests {
         buckets.add(day(2), "p", &entry("unknown", 500)); // latest model is unpriced
         buckets.add(day(2), "q", &entry("unknown", 7));
 
-        let fold = buckets.fold(day(1), day(3), price, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(1), day(3), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.totals.output_tokens, 517);
         assert_eq!(fold.totals.cost, Some(10.0), "only the priced bucket costs");
         assert_eq!(fold.totals.cost_basis, Some(CostBasis::ApiEquivalent));
@@ -376,7 +380,7 @@ mod tests {
         buckets.add(day(1), "p", &entry("cheap", 2));
 
         assert_eq!(buckets.iter().count(), 2, "one bucket per model");
-        let fold = buckets.fold(day(1), day(2), rate, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(1), day(2), rate, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.totals.output_tokens, 17);
         assert_eq!(fold.totals.entries, 3);
         assert_eq!(fold.totals.cost, Some(12.0 + 15.0), "12 cheap at 1 plus 5 dear at 3");
@@ -386,6 +390,33 @@ mod tests {
 
     /// A row names the model with the most output tokens in the window, not
     /// the latest one; a model-less bucket never names it.
+    /// Keys of one alias target fold into one row named after the target; its
+    /// model is the one with the most output summed over every merged key, and
+    /// the outside-projects bucket stays its own row.
+    #[test]
+    fn aliased_keys_fold_into_one_row() {
+        let target = crate::usage::normalize_project_path("/r/sortea");
+        let wt = crate::usage::normalize_project_path("/r/sortea-wt/t1");
+        let map = BTreeMap::from([("/r/sortea-wt".to_string(), "/r/sortea".to_string())]);
+        let aliases = ProjectAliases::new(&map);
+        let mut buckets = DailyBuckets::default();
+        buckets.add(day(1), &target, &entry("priced", 10));
+        buckets.add(day(1), &target, &entry("other", 25));
+        buckets.add(day(2), &wt, &entry("priced", 20));
+        buckets.add(day(2), "", &entry("priced", 1));
+
+        let fold = buckets.fold(day(1), day(3), price, CostBasis::ApiEquivalent, &aliases);
+        assert_eq!(fold.projects.len(), 2);
+        let row = fold.projects.iter().find(|r| r.path == target).expect("the target row");
+        assert_eq!(row.name, "sortea");
+        assert_eq!(row.totals.output_tokens, 55);
+        assert_eq!(row.totals.entries, 3);
+        assert_eq!(row.totals.cost, Some(30.0), "both priced buckets");
+        assert_eq!(row.model, "priced", "10 + 20 across the two keys beats 25");
+        assert!(fold.projects.iter().any(|r| r.path.is_empty() && r.totals.output_tokens == 1));
+        assert_eq!(fold.totals.output_tokens, 56);
+    }
+
     #[test]
     fn a_project_row_names_the_model_with_the_most_output() {
         let mut buckets = DailyBuckets::default();
@@ -394,9 +425,9 @@ mod tests {
         buckets.add(day(2), "p", &entry("small", 100));
         buckets.add(day(3), "p", &entry("", 1000));
 
-        let fold = buckets.fold(day(1), day(4), price, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(1), day(4), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.projects[0].model, "big", "110 output across two days beats 100");
-        let only_day_two = buckets.fold(day(2), day(3), price, CostBasis::ApiEquivalent);
+        let only_day_two = buckets.fold(day(2), day(3), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(only_day_two.projects[0].model, "small", "counted over the window only");
     }
 
@@ -405,7 +436,7 @@ mod tests {
         let mut buckets = DailyBuckets::default();
         buckets.add(day(1), "p", &entry("unknown", 10));
 
-        let fold = buckets.fold(day(1), day(2), price, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(1), day(2), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.totals.output_tokens, 10);
         assert_eq!(fold.totals.cost, None);
         assert_eq!(fold.totals.cost_basis, None);
@@ -419,7 +450,7 @@ mod tests {
         buckets.add(day(1), "", &entry("priced", 5));
         buckets.add(day(1), "C:\\repos\\orbitbar", &entry("priced", 10));
 
-        let fold = buckets.fold(day(1), day(2), price, CostBasis::Reported);
+        let fold = buckets.fold(day(1), day(2), price, CostBasis::Reported, &ProjectAliases::default());
         assert_eq!(fold.totals.output_tokens, 15);
         assert_eq!(fold.totals.entries, 2);
         assert_eq!(fold.totals.cost, Some(15.0));
@@ -440,7 +471,7 @@ mod tests {
         let mut buckets = DailyBuckets::default();
         buckets.add(day(1), "p", &entry("priced", 10));
 
-        let fold = buckets.fold(day(5), day(6), price, CostBasis::ApiEquivalent);
+        let fold = buckets.fold(day(5), day(6), price, CostBasis::ApiEquivalent, &ProjectAliases::default());
         assert_eq!(fold.totals, UsageTotals::default());
         assert!(fold.projects.is_empty());
     }

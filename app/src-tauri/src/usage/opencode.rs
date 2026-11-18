@@ -17,7 +17,8 @@
 //! the rows sum to the totals.
 
 use crate::usage::{
-    normalize_project_path, project_display_name, project_key, AgentUsageReport, CostBasis, ProjectRootCache, ProjectUsage, UsageTotals,
+    normalize_project_path, project_display_name, project_key, AgentUsageReport, CostBasis, ProjectAliases,
+    ProjectRootCache, ProjectUsage, UsageTotals,
 };
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OpenFlags};
@@ -29,12 +30,14 @@ const AGENT: &str = "opencode";
 /// Reads window usage from the opencode SQLite store at `db_path`.
 /// Per-project totals are keyed by resolved project root (see
 /// `resolve_project_root`), not the raw `project.worktree` path, so two
-/// worktrees inside the same repository merge into one row.
+/// worktrees inside the same repository merge into one row, and each project
+/// is reported under its alias (see `ProjectAliases::merge_rows`).
 pub fn read_usage(
     db_path: &Path,
     start: DateTime<Local>,
     end: DateTime<Local>,
     root_cache: &mut ProjectRootCache,
+    aliases: &ProjectAliases,
 ) -> AgentUsageReport {
     if !db_path.exists() {
         return AgentUsageReport::not_installed(AGENT, format!("database not found: {}", db_path.display()));
@@ -60,7 +63,7 @@ pub fn read_usage(
     };
 
     let projects = match read_projects(&conn, start_ms, end_ms, root_cache) {
-        Ok(p) => p,
+        Ok(p) => aliases.merge_rows(p),
         Err(e) => return AgentUsageReport::error(AGENT, format!("cannot read per-project totals: {e}")),
     };
 
@@ -214,7 +217,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("opencode.db");
         let (start, end) = window();
-        let report = read_usage(&missing, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&missing, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::NotInstalled);
     }
 
@@ -237,7 +240,7 @@ mod tests {
         drop(conn);
 
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::Ok);
         assert_eq!(report.totals.cost, Some(1.2345));
         assert_eq!(report.totals.output_tokens, 500);
@@ -284,7 +287,7 @@ mod tests {
             temp_dirs: Vec::new(),
             home: Some(dir.path().to_path_buf()),
         });
-        let report = read_usage(&db_path, start, end, &mut cache);
+        let report = read_usage(&db_path, start, end, &mut cache, &ProjectAliases::default());
         assert_eq!(report.projects.len(), 1, "both worktrees share the same repo root");
         assert_eq!(report.projects[0].totals.output_tokens, 30, "tokens from both worktrees must sum");
         assert_eq!(report.projects[0].totals.cost, Some(3.0), "cost from both worktrees must sum");
@@ -310,7 +313,7 @@ mod tests {
         drop(conn);
 
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.totals.cost, Some(0.0), "a real zero must be reported, not treated as missing");
     }
 
@@ -334,7 +337,7 @@ mod tests {
         drop(conn);
 
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.totals.entries, 1);
         assert_eq!(report.totals.output_tokens, 50);
     }
@@ -346,7 +349,7 @@ mod tests {
         make_db(&path);
 
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.status, AgentStatus::Ok);
         assert_eq!(report.totals.entries, 0);
         assert_eq!(report.totals.cost, None);
@@ -391,7 +394,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
         });
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut cache);
+        let report = read_usage(&path, start, end, &mut cache, &ProjectAliases::default());
 
         assert_eq!(report.totals.entries, 3);
         assert_eq!(report.totals.output_tokens, 1210);
@@ -425,7 +428,7 @@ mod tests {
         drop(conn);
 
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new(), &ProjectAliases::default());
         assert_eq!(report.totals.entries, 2);
         assert_eq!(report.projects.len(), 1);
         assert_eq!(report.projects[0].path, "");
@@ -460,7 +463,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
         });
         let (start, end) = window();
-        let report = read_usage(&path, start, end, &mut cache);
+        let report = read_usage(&path, start, end, &mut cache, &ProjectAliases::default());
 
         assert_eq!(report.totals.entries, 1);
         assert_eq!(report.totals.cost, Some(2.5));

@@ -80,7 +80,7 @@ config directory.
 | Placement | `app/src-tauri/src/placement.rs` | Pure window-placement rules: grow toward the side with room, clamp into the work area, collapse anchoring, restoring a saved position |
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
-| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir, an existing folder outside any repo, or no cwd is keyed `OUTSIDE_PROJECTS` (`""`, see `project_key`), counted in the totals and shown as the "Outside projects" row; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
+| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project aliases (`ProjectAliases`), project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir, an existing folder outside any repo, or no cwd is keyed `OUTSIDE_PROJECTS` (`""`, see `project_key`), counted in the totals and shown as the "Outside projects" row; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
 | Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key, model)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket at its own model |
 | Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged per `(date, project)` group with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
@@ -128,8 +128,10 @@ config directory.
    `last365Days`, today plus the previous 364 days),
    starting with `today`.
 2. `get_usage` (in `lib.rs`) resolves the four store paths under the
-   user's home directory, loads `pricing.json` if present, passes the path
-   of `usage-ledger.json` in the same config directory, and runs the
+   user's home directory, loads `pricing.json` if present, reads
+   `projectAliases` from `config.json` without writing it
+   (`config::read_project_aliases`), passes the path of
+   `usage-ledger.json` in the same config directory, and runs the
    whole read off the main thread (`spawn_blocking`) so a large history
    never stalls the window.
 3. `usage::collect_usage` calls each reader, in the order the snapshot
@@ -155,7 +157,14 @@ config directory.
    the most output tokens in the window. In every reader, usage outside any
    repository (temp dir, a plain folder, no cwd) is keyed `""` and becomes
    an "Outside projects" row with an empty path, so the rows always sum to
-   the totals; `usage-view.ts` gives it its own tooltip.
+   the totals; `usage-view.ts` gives it its own tooltip. Project aliases
+   (`usage::ProjectAliases`) apply only here, at report time: the fold
+   reports a key equal to or under an alias path (whole components, letter
+   case ignored on Windows, longest alias first) under the alias target, and
+   codex and opencode merge their priced rows with
+   `ProjectAliases::merge_rows`. The ledger and the `claude-bridge` check keep
+   the un-aliased keys, so a changed alias applies to the whole history; the
+   `""` key is never aliased.
 5. Before folding, the claude and pi buckets are merged with the ledger
    (`usage::ledger::Session`, which holds a process-wide lock from the load
    to the write). Per `(agent, date, project)` group (every model of that

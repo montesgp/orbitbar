@@ -15,8 +15,8 @@
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectRootCache,
-    UsageTotals, OUTSIDE_PROJECTS,
+    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
+    ProjectRootCache, UsageTotals, OUTSIDE_PROJECTS,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
@@ -53,7 +53,7 @@ pub fn read_usage(
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
     match read_daily(root, claude, root_cache) {
-        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides),
+        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides, &ProjectAliases::default()),
         Err(report) => *report,
     }
 }
@@ -155,8 +155,14 @@ pub fn read_daily(
 
 /// The window report for the local dates in `[start, end)`. Each bucket is
 /// priced with its own model; a cache write is priced as a 5-minute write,
-/// since Pi does not split it by TTL.
-pub fn report(daily: &PiDaily, start: NaiveDate, end: NaiveDate, overrides: &pricing::PriceOverrides) -> AgentUsageReport {
+/// since Pi does not split it by TTL. Each project is reported under its alias.
+pub fn report(
+    daily: &PiDaily,
+    start: NaiveDate,
+    end: NaiveDate,
+    overrides: &pricing::PriceOverrides,
+    aliases: &ProjectAliases,
+) -> AgentUsageReport {
     // With no session file left, the ledger may still hold days to fold.
     if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
         return AgentUsageReport::ok(AGENT, UsageTotals::default(), Vec::new(), "no session files yet");
@@ -166,7 +172,7 @@ pub fn report(daily: &PiDaily, start: NaiveDate, end: NaiveDate, overrides: &pri
         pricing::estimate_cost(&c.model, c.input, c.output, c.cache_read, c.cache_write_5m, c.cache_write_1h, overrides)
             .amount
     };
-    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
+    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent, aliases);
     let in_window = |per_day: &BTreeMap<NaiveDate, u64>| -> u64 { per_day.range(start..end.max(start)).map(|(_, n)| n).sum() };
     let skipped = in_window(&daily.bridge_skipped);
 

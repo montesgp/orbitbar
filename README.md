@@ -208,6 +208,7 @@ Orbitbar creates `config.json` with defaults on first launch (paths per OS in
 | `autoStart` | Start Orbitbar at login (on by default; release builds only). The menu's **Start with system** entry changes it for you: its check mark shows the real OS registration, and selecting it updates the OS entry and this field. |
 | `autoUpdate` | Check this repository's GitHub Releases for a signed update and install it (on by default; release builds only, and on Linux only the AppImage). The menu's **Automatic updates** entry changes it for you. See [Updating](#updating). |
 | `showExamples` | Show the example cells (items flagged `"example": true`). Off by default. The menu's **Show example action** entry changes it for you. |
+| `projectAliases` | Usage-panel projects shown under another project, for example a deleted worktree under its main repository. Empty by default. See [Project aliases](#project-aliases). |
 | `items` | The cells on the bar, each with `id`, `glyph`, `label`, `tooltip` and `action`, and optionally `"example": true`. |
 
 Item actions:
@@ -270,6 +271,35 @@ you already have is not rewritten, so add the `github` item there by hand
 
 If `config.json` cannot be parsed, Orbitbar renames it to
 `config.json.invalid` and starts on the defaults.
+
+### Project aliases
+
+`projectAliases` maps a project path to the project it should be counted
+under in the usage panel. Use it to join the rows of a worktree or a renamed
+folder with the repository they belong to:
+
+```json
+"projectAliases": {
+  "R:\\repositories\\personal\\sortea-wt": "R:\\repositories\\personal\\sortea"
+}
+```
+
+On macOS and Linux:
+
+```json
+"projectAliases": {
+  "/Users/me/code/sortea-wt": "/Users/me/code/sortea"
+}
+```
+
+A project whose path is the alias path, or a folder inside it, is shown under
+the target path, and its tokens, entries and cost are added to that row.
+Paths match by whole folder names (`sortea-wt` never matches `sortea-wt2`),
+ignoring letter case on Windows only, and the longest matching alias wins.
+Neither path has to exist. Aliases apply only to what the panel shows: the
+history in `usage-ledger.json` keeps the original paths, so adding, changing or
+removing an alias applies to the whole history at the next refresh. The
+**Outside projects** row is never aliased.
 
 ### Custom model prices
 

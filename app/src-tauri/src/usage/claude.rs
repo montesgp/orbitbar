@@ -18,8 +18,8 @@
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectRootCache,
-    UsageTotals,
+    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
+    ProjectRootCache, UsageTotals,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
@@ -50,7 +50,7 @@ pub fn read_usage(
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
     match read_daily(root, root_cache) {
-        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides),
+        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides, &ProjectAliases::default()),
         Err(report) => *report,
     }
 }
@@ -156,12 +156,14 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
 }
 
 /// The window report for the local dates in `[start, end)`. Each bucket is
-/// priced with its own model and the amounts summed (see `DailyBuckets::fold`).
+/// priced with its own model and the amounts summed (see `DailyBuckets::fold`),
+/// and each project reported under its alias.
 pub fn report(
     daily: &ClaudeDaily,
     start: NaiveDate,
     end: NaiveDate,
     overrides: &pricing::PriceOverrides,
+    aliases: &ProjectAliases,
 ) -> AgentUsageReport {
     // With no session file left, the ledger may still hold days to fold.
     if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
@@ -172,7 +174,7 @@ pub fn report(
         pricing::estimate_cost(&c.model, c.input, c.output, c.cache_read, c.cache_write_5m, c.cache_write_1h, overrides)
             .amount
     };
-    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
+    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent, aliases);
     let detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
     AgentUsageReport::ok(AGENT, fold.totals, fold.projects, detail)
 }

@@ -50,16 +50,28 @@ fn save_config(app: tauri::AppHandle, cfg: config::AppConfig) -> Result<(), Stri
 /// `usage-ledger.json` in the same folder is Orbitbar's own history of the
 /// claude and pi daily totals (see `usage::ledger`); it is the only file this
 /// writes, never one of the agents' files.
+///
+/// `projectAliases` is read from `config.json` on every call too (read-only,
+/// see `config::read_project_aliases`), so an edited alias applies on the
+/// next refresh.
 #[tauri::command]
 async fn get_usage(app: tauri::AppHandle, window: usage::TimeWindow) -> Result<usage::UsageSnapshot, String> {
     let config_dir = config::config_dir(&app)?;
     let pricing_path = config_dir.join("pricing.json");
     let ledger_path = config_dir.join(usage::ledger::FILE_NAME);
+    let config_path = config_dir.join("config.json");
     tauri::async_runtime::spawn_blocking(move || {
         let paths = usage::resolve_paths(None).ok_or_else(|| "cannot resolve home directory".to_string())?;
         let (overrides, pricing_warning) = usage::pricing::load_overrides(&pricing_path);
-        let mut snapshot =
-            usage::collect_usage(window, &paths, chrono::Local::now(), &overrides, Some(&ledger_path));
+        let aliases = usage::ProjectAliases::new(&config::read_project_aliases(&config_path));
+        let mut snapshot = usage::collect_usage(
+            window,
+            &paths,
+            chrono::Local::now(),
+            &overrides,
+            Some(&ledger_path),
+            &aliases,
+        );
         snapshot.pricing_warning = pricing_warning;
         Ok(snapshot)
     })
