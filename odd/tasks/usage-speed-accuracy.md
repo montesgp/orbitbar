@@ -52,7 +52,7 @@ merge project rows, and shows usage that ran outside any repository instead of d
 | T2 | S4 | gentle-ai-worker: D2 | done | `d9a1e16` |
 | T3 | S2 | gentle-ai-worker: D3 | done | `99da098` |
 | T4 | S1 | gentle-ai-worker: D4 | done | `68c4db6` |
-| T5 | S1-S4 | gentle-ai-verify (high risk: ledger format, concurrency) | pending | |
+| T5 | S1-S4 | gentle-ai-verify (high risk: ledger format, concurrency) | done | see L5 |
 | T6 | all | PR to `dev`, `ci-gate`, merge | pending | |
 
 ## Log
@@ -70,3 +70,9 @@ merge project rows, and shows usage that ran outside any repository instead of d
   "Precio por modelo", "Mostrar lo no contado".
 - **L4** (2026-11-18, T3 worker): separate bug found, not fixed here: a missing folder directly under a Windows
   drive root gets a key like `R:name` (the separator is dropped). Follow-up.
+- **L5** (2026-11-18, verify on `b084cbf`): S1-S4 and D1-D4 PASS, no blockers; 244 tests, clippy clean. Real data,
+  this month, dev vs branch: Claude 36,522 counted + 933 previously dropped = 37,455 vs 37,454 now (one live entry);
+  Pi 30 newly counted + 507 newly skipped bridge turns = the 537 previously excluded. Timing (debug): cold 75.8 s,
+  warm 0.75 s, identical output. Advisories: Codex rows still priced at one model per session; panel opened during
+  the cold warm-up parses twice (correct, extra IO); cached dates fixed at parse time if the system time zone
+  changes while running.
