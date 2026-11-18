@@ -165,7 +165,9 @@ its own formats; build on the OS you are targeting. See
   settings cell**, for the menu: edit `config.json`, open `pricing.json`,
   collapse or expand, reload the config without a restart, switch between
   Light and Dark, turn **Start with system**, **Automatic updates** or
-  **Show example action** on or off, or quit. Escape or a click outside closes the menu.
+  **Show example action** on or off, or quit. The last line of the menu shows
+  the version that is running (for example `Orbitbar 0.3.2`), so you can tell
+  when an automatic update has arrived. Escape or a click outside closes the menu.
 - **Drag the bar** to move it anywhere; it stays where you drop it, keeps
   inside the monitor's usable area (not under the taskbar) and comes back
   there after a restart. The panel and the menu open on the bar's left, or on
