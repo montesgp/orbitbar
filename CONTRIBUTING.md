@@ -63,8 +63,9 @@ hotfix/... ──────────────► main ──► back int
 
 ### Hotfixes
 
-Orbitbar is a desktop app that people update by hand, so most fixes simply go
-through `dev` like any other change. Use a hotfix only when a released version
+Installed copies update themselves from the latest release, so a release
+reaches every user within hours; most fixes still simply go through `dev`
+like any other change. Use a hotfix only when a released version
 is broken and `dev` holds work that is not ready to ship:
 
 1. Create `hotfix/<short-name>` from `main`.
@@ -118,14 +119,41 @@ username before pasting.
    installers for Windows (x64, and ARM64 cross-compiled), macOS (universal)
    and Linux (x64, and ARM64 on the `ubuntu-22.04-arm` runner) with
    `tauri-apps/tauri-action` and publishes them as the GitHub Release
-   "Orbitbar vX.Y.Z". The installers are unsigned. Check the release page
-   afterwards for the expected assets.
+   "Orbitbar vX.Y.Z". The installers are not code-signed, but the update
+   bundles are signed with the updater key (see
+   [Updater signing key](#updater-signing-key)). Check the release page
+   afterwards for the expected assets: the installers, each update bundle
+   with its `.sig` file, and `latest.json`, which installed copies read to
+   find the update. A `latest.json` that lacks a platform means that
+   platform's installs do not see the release.
 5. The [download page](https://montesgp.github.io/orbitbar/) follows the new
    release by itself: it reads the latest release from the GitHub API and
    picks each installer by its name pattern (`_x64-setup.exe`,
    `_arm64-setup.exe`, `_universal.dmg`, `_amd64.AppImage`,
    `_aarch64.AppImage`, ...). If the installer names change,
    update the patterns in `site/main.js`.
+
+### Updater signing key
+
+The Release workflow signs the update bundles with two repository secrets,
+`TAURI_SIGNING_PRIVATE_KEY` (the private key) and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (its password). The matching public key
+is `plugins.updater.pubkey` in `app/src-tauri/tauri.conf.json`, and every
+installed copy accepts only updates signed with it.
+
+- The key files live outside the repository, in the owner's `~/.tauri/`
+  (`orbitbar-updater.key`, `.key.password`, `.key.pub`). Never commit or
+  print them. Back them up somewhere safe: GitHub does not let anyone read a
+  secret back.
+- Losing the private key means existing installs can no longer be updated.
+  A new key pair needs a new public key in `tauri.conf.json`, and copies
+  with the old key accept nothing signed with the new one, so their users
+  have to install the next release by hand.
+- Building installers locally runs the same signing step: without
+  `TAURI_SIGNING_PRIVATE_KEY` set, `npm run tauri build` fails. Build the
+  binary with `npx tauri build --no-bundle`, or installers without update
+  bundles with
+  `npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'`.
 
 ## Download page
 

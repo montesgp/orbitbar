@@ -104,9 +104,19 @@ DOM code so it stays unit-testable.
   at the exact executable path that registered it.
 - **Orbitbar only reads agent data.** The files in
   [README.md § Data sources](README.md#data-sources) are opened read-only.
-  Do not add writes to them or any network calls. The one file the usage
+  Do not add writes to them or any other network calls. The one file the usage
   code writes is Orbitbar's own `usage-ledger.json` in its config directory
-  (see [docs/architecture.md](docs/architecture.md)).
+  (see [docs/architecture.md](docs/architecture.md)). The one network call
+  is the update check: `tauri-plugin-updater` fetches `latest.json` from
+  this repository's GitHub Releases and installs only an update signed with
+  the project's updater key; `autoUpdate` in `config.json` (the menu's
+  "Automatic updates") turns it off. Debug builds never check.
+- **Installers need the updater key.** `bundle.createUpdaterArtifacts` signs
+  the update bundles, so `npm run tauri build` fails at the signing step
+  without `TAURI_SIGNING_PRIVATE_KEY`. Only the owner and the Release
+  workflow have it. Without it, build the binary with
+  `npx tauri build --no-bundle`, or installers with
+  `npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'`.
 - **Version bumps touch four files**, kept equal; see
   [CONTRIBUTING.md § Release process](CONTRIBUTING.md#release-process).
   Releases run only when a `vX.Y.Z` tag is pushed.

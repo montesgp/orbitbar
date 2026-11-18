@@ -20,8 +20,9 @@ for the time window you pick. It runs on Windows, macOS and Linux.
 - **Usage per agent and per project.** Output tokens and cost for Today,
   the last 7 days, the last 30 days, the current month or the last 365 days.
 - **Local data only.** Orbitbar reads the session history your agents
-  already keep on disk. It needs no account, sends no telemetry and makes no
-  network calls.
+  already keep on disk. It needs no account and sends no telemetry. Its one
+  network call is the update check against this repository's GitHub
+  Releases, which you can turn off. See [Updating](#updating).
 - **A year of history.** Orbitbar keeps its own daily totals for Claude Code
   and Pi, so usage stays visible after an agent deletes old sessions. See
   [History](#history).
@@ -56,10 +57,26 @@ Agents are optional: Orbitbar reads whichever of Claude Code, Codex and
 OpenCode are installed and reports the others as not installed. SQLite is
 compiled into the binary, so there is nothing else to install.
 
-**Updating:** Orbitbar does not update itself yet. To move to a newer
-version, close the bar and run the installer from the latest release; your
-`config.json` is kept. The [roadmap](#roadmap) tracks in-app update
-notifications.
+### Updating
+
+From 0.3.0 on, Orbitbar updates itself. About 30 seconds after it starts,
+and then every 6 hours, it downloads `latest.json` from this repository's
+[latest release](https://github.com/montesgp/orbitbar/releases/latest). When
+that names a newer version, Orbitbar downloads it, checks its signature
+against the project's updater key, installs it and restarts. An update that
+is not signed with that key is never installed. Nothing else is sent or
+received.
+
+- Updates are on by default. Turn them off with **Automatic updates** in the
+  bar's menu, or set `autoUpdate` to `false` in `config.json`. The change
+  applies from the next check, without a restart.
+- On Windows the update runs the installer in passive mode: a progress
+  window shows briefly, with no questions.
+- On Linux only the AppImage updates itself. A `.deb` or `.rpm` install is
+  updated like any other package: install the new one from the latest
+  release with your package manager.
+- Versions before 0.3.0 do not update themselves: close the bar and run the
+  installer from the latest release once. Your `config.json` is kept.
 
 ### First run: unsigned installers
 
@@ -124,6 +141,14 @@ npm run tauri build   # installer or app bundle for the current OS
 
 Use `npm run tauri dev` instead to run with hot reload while you work on it.
 
+The installer build also signs the update bundles, so without the project's
+updater key (`TAURI_SIGNING_PRIVATE_KEY`) `npm run tauri build` fails at
+the signing step. Skip the update bundles with
+`npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'`,
+or build only the binary with `npx tauri build --no-bundle`. A copy you
+build yourself still checks this repository's releases for updates unless
+you turn **Automatic updates** off.
+
 `npm run tauri build` writes the installers under
 `app/src-tauri/target/release/bundle/`, in one folder per format
 (`nsis`, `msi`, `dmg`, `macos`, `deb`, `rpm`, `appimage`). Each OS produces
@@ -139,7 +164,8 @@ its own formats; build on the OS you are targeting. See
 - **Right-click the bar** (or the collapsed tab), or **left-click the
   settings cell**, for the menu: edit `config.json`, open `pricing.json`,
   collapse or expand, reload the config without a restart, switch between
-  Light and Dark, turn **Start with system** or **Show example action** on or off, or quit. Escape or a click outside closes the menu.
+  Light and Dark, turn **Start with system**, **Automatic updates** or
+  **Show example action** on or off, or quit. Escape or a click outside closes the menu.
 - **Drag the bar** to move it anywhere; it stays where you drop it, keeps
   inside the monitor's usable area (not under the taskbar) and comes back
   there after a restart. The panel and the menu open on the bar's left, or on
@@ -180,6 +206,7 @@ Orbitbar creates `config.json` with defaults on first launch (paths per OS in
 | `position` | Where the bar was dropped: `{ "x": 1836, "y": 340 }`, its top-left corner in physical screen pixels (negative on a monitor left of or above the primary). Written when you drag the bar or collapse/expand it; absent until then. Read at startup: a position that is partly off-screen is pulled back in, one that is off every monitor is ignored and the bar goes to the right edge of `monitor`. Delete the field to reset the placement. |
 | `collapsed` | Whether the bar starts as the small tab. |
 | `autoStart` | Start Orbitbar at login (on by default; release builds only). The menu's **Start with system** entry changes it for you: its check mark shows the real OS registration, and selecting it updates the OS entry and this field. |
+| `autoUpdate` | Check this repository's GitHub Releases for a signed update and install it (on by default; release builds only, and on Linux only the AppImage). The menu's **Automatic updates** entry changes it for you. See [Updating](#updating). |
 | `showExamples` | Show the example cells (items flagged `"example": true`). Off by default. The menu's **Show example action** entry changes it for you. |
 | `items` | The cells on the bar, each with `id`, `glyph`, `label`, `tooltip` and `action`, and optionally `"example": true`. |
 
@@ -310,8 +337,7 @@ bar. See [extensions/README.md](extensions/README.md).
 
 Planned work is tracked as GitHub issues labeled
 [`enhancement`](https://github.com/montesgp/orbitbar/issues?q=is%3Aissue+label%3Aenhancement).
-Next up: an update notice in the bar's menu when a newer release is
-available, with a link to it, and later an in-app update.
+Automatic updates shipped in 0.3.0 (see [Updating](#updating)).
 
 ## Contributing
 
