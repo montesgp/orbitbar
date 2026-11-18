@@ -5,6 +5,7 @@ import {
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   barFromWindow,
@@ -115,13 +116,24 @@ const PANEL_WIDTH = 320;
  * the height, not just the width.
  */
 const CONTEXT_MENU_WIDTH = 170;
-const CONTEXT_MENU_MIN_HEIGHT = 364;
-/** Ten entries plus three separators, sized from `.context-menu`'s own CSS;
+const CONTEXT_MENU_MIN_HEIGHT = 386;
+/** Ten entries, three separators and the version line, sized from
+ * `.context-menu`'s own CSS (the version line adds 22px);
  * kept as a constant instead of measured so opening the menu never needs an
  * extra hidden-then-remeasure paint. */
-const CONTEXT_MENU_HEIGHT_ESTIMATE = 337;
+const CONTEXT_MENU_HEIGHT_ESTIMATE = 359;
 
 const win = getCurrentWindow();
+
+/** The running app version, shown at the bottom of the context menu. Read
+ * once at startup; `null` until then or if it cannot be read, in which case
+ * the line is simply left out. */
+let appVersion: string | null = null;
+getVersion()
+  .then((v) => {
+    appVersion = v;
+  })
+  .catch((err) => console.error("orbitbar: could not read the app version", err));
 
 /**
  * No default WebView2/browser context menu anywhere in the bar — the menu
@@ -518,6 +530,14 @@ function renderContextMenu(
       })();
     });
     el.appendChild(btn);
+  }
+  // The running version, so an automatic update can be confirmed at a glance.
+  // Plain text, not a menu entry: it does nothing when clicked.
+  if (appVersion) {
+    const version = document.createElement("div");
+    version.className = "context-menu-version";
+    version.textContent = `Orbitbar ${appVersion}`;
+    el.appendChild(version);
   }
 }
 

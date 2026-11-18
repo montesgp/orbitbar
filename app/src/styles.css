@@ -441,6 +441,19 @@ body.side-right .context-menu.open {
   width: 1.2em;
 }
 
+/* The running version at the bottom of the menu: informational, not clickable.
+ * 22px tall in total (4px top border gap + 18px line), see main.ts. */
+.context-menu-version {
+  margin-top: 4px;
+  padding: 3px 8px 0;
+  border-top: 1px solid color-mix(in srgb, var(--ob-text-dim) 35%, transparent);
+  color: var(--ob-text-dim);
+  font-size: 0.9em;
+  line-height: 14px;
+  cursor: default;
+  user-select: text;
+}
+
 .context-menu-separator {
   height: 1px;
   margin: 4px 2px;
