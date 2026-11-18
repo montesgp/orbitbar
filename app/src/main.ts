@@ -77,6 +77,10 @@ export interface OrbitbarConfig {
    * until it is first moved; Rust falls back to right-center of `monitor`
    * when it is absent or no longer on any monitor. */
   position?: { x: number; y: number } | null;
+  /** Usage-panel project aliases: a path reported under another project's
+   * path. Only edited by hand in config.json; Rust always sends it (empty by
+   * default), so saving this object back keeps it and a reload replaces it. */
+  projectAliases?: Record<string, string>;
   items: Item[];
 }
 
@@ -729,9 +733,9 @@ function renderUsageSection(section: AgentSectionViewModel, onToggleProjects: ()
     for (const project of section.topProjects) {
       const row = document.createElement("div");
       row.className = "usage-project-row";
-      // The full normalized path, so a disambiguated or truncated name never
-      // loses the real location.
-      row.title = project.path;
+      // The full path, so a disambiguated or truncated name never loses the
+      // real location; for "Outside projects", what the row holds.
+      row.title = project.tooltip;
 
       const name = document.createElement("span");
       name.className = "usage-project-name";

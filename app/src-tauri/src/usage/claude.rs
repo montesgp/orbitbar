@@ -11,13 +11,14 @@
 //! `(local date, project key)` bucket (see `usage::daily`) and [`report`]
 //! folds the window's dates. The totals and the per-project breakdown come
 //! from the same buckets, so the per-project split always matches what the
-//! totals claim for the same window. Sessions outside any project (a cwd under the OS temp dir, or an existing
-//! folder that is not inside a repository; see `resolve_project_root`) are
-//! left out of the totals and the project rows alike, so that invariant holds.
+//! totals claim for the same window. Entries outside any project (a cwd under
+//! the OS temp dir, an existing folder that is not inside a repository, or no
+//! cwd; see `project_key`) count in the "Outside projects" row, so that
+//! invariant holds.
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, resolve_project_root, AgentUsageReport, CostBasis,
+    cache::FileCache, find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
     ProjectRootCache, UsageTotals,
 };
 use chrono::{DateTime, Local, NaiveDate};
@@ -28,15 +29,20 @@ use std::path::Path;
 
 pub const AGENT: &str = "claude";
 
+/// One session file's entries before project-root resolution: summed per
+/// `(local date, normalized raw cwd, model)`, which is what
+/// `usage::cache` keeps per file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileUsage {
+    entries: BTreeMap<(NaiveDate, String, String), DailyCounters>,
+}
+
 /// Everything one scan of the store found, before any window is applied.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeDaily {
-    /// Every entry, by local date and resolved project root (`""`: no cwd).
+    /// Every entry, by local date and project key (see `project_key`).
     pub buckets: DailyBuckets,
     pub files_scanned: u64,
-    /// Entries whose cwd is excluded (see `resolve_project_root`), per local
-    /// date. They are in no bucket, so neither the totals nor the rows count them.
-    pub excluded: BTreeMap<NaiveDate, u64>,
 }
 
 /// Reads month/window usage from every claude session file under `root`,
@@ -51,8 +57,8 @@ pub fn read_usage(
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
-    match read_daily(root, root_cache) {
-        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides),
+    match read_daily(root, &FileCache::default(), root_cache) {
+        Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides, &ProjectAliases::default()),
         Err(report) => *report,
     }
 }
@@ -60,9 +66,14 @@ pub fn read_usage(
 /// Scans every session file under `root` into daily buckets. Per-project
 /// buckets are keyed by resolved project root (see `resolve_project_root`),
 /// not the raw session cwd, so two cwds inside the same repository share a
-/// bucket. `Err` carries the finished report when there is nothing to fold:
-/// the store is missing, or no session file could be read.
-pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<ClaudeDaily, Box<AgentUsageReport>> {
+/// bucket. Only files that changed since the last call are read again (see
+/// `usage::cache`). `Err` carries the finished report when there is nothing
+/// to fold: the store is missing, or no session file could be read.
+pub fn read_daily(
+    root: &Path,
+    cache: &FileCache<FileUsage>,
+    root_cache: &mut ProjectRootCache,
+) -> Result<ClaudeDaily, Box<AgentUsageReport>> {
     if !root.exists() {
         return Err(Box::new(AgentUsageReport::not_installed(
             AGENT,
@@ -71,92 +82,11 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
     }
 
     let files = find_jsonl_files(root);
-    let mut daily = ClaudeDaily::default();
-
-    for file in &files {
-        let Ok(handle) = std::fs::File::open(file) else { continue };
-        daily.files_scanned += 1;
-        let reader = BufReader::new(handle);
-
-        // Dedupe is per file: the same requestId can appear in more than one
-        // session file (a resumed session, a subagent transcript), and those
-        // are separate billable events.
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            if !line.contains("\"usage\"") {
-                continue;
-            }
-            // A malformed line is skipped, never fatal to the file.
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-
-            let usage = entry
-                .get("message")
-                .and_then(|m| m.get("usage"))
-                .or_else(|| entry.get("usage"));
-            let Some(usage) = usage else { continue };
-
-            let key = entry
-                .get("requestId")
-                .and_then(Value::as_str)
-                .or_else(|| entry.get("message").and_then(|m| m.get("id")).and_then(Value::as_str))
-                .or_else(|| entry.get("uuid").and_then(Value::as_str));
-            if let Some(key) = key {
-                if !seen.insert(key.to_string()) {
-                    continue;
-                }
-            }
-
-            // An entry without a readable timestamp belongs to no day, so no
-            // window can count it.
-            let Some(date) = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local).date_naive())
-            else {
-                continue;
-            };
-
-            let cwd = entry.get("cwd").and_then(Value::as_str).unwrap_or("");
-            let cwd = normalize_project_path(cwd);
-            // An entry with no cwd stays in the totals without a project row.
-            let project_key = if cwd.is_empty() {
-                cwd
-            } else {
-                match resolve_project_root(&cwd, root_cache) {
-                    Some(root) => root,
-                    None => {
-                        *daily.excluded.entry(date).or_default() += 1;
-                        continue;
-                    }
-                }
-            };
-
-            let model = entry
-                .get("message")
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|m| !m.is_empty() && !m.starts_with('<'))
-                .unwrap_or("");
-
-            let (cache_write_5m, cache_write_1h) = extract_cache_write(usage);
-            let counters = DailyCounters {
-                input: get_u64(usage, "input_tokens"),
-                output: get_u64(usage, "output_tokens"),
-                cache_read: get_u64(usage, "cache_read_input_tokens"),
-                cache_write_5m,
-                cache_write_1h,
-                reasoning: usage
-                    .get("output_tokens_details")
-                    .map(|d| get_u64(d, "thinking_tokens"))
-                    .unwrap_or(0),
-                entries: 1,
-                model: model.to_string(),
-            };
-            daily.buckets.add(date, &project_key, &counters);
+    let parsed = cache.load(root, &files, parse_file);
+    let mut daily = ClaudeDaily { files_scanned: parsed.len() as u64, ..Default::default() };
+    for file in &parsed {
+        for ((date, cwd, _), counters) in &file.entries {
+            daily.buckets.add(*date, &project_key(cwd, root_cache), counters);
         }
     }
 
@@ -169,13 +99,94 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
     Ok(daily)
 }
 
+/// Reads one session file; `None` when it cannot be opened.
+fn parse_file(file: &Path) -> Option<FileUsage> {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    let mut out = FileUsage::default();
+
+    // Dedupe is per file: the same requestId can appear in more than one
+    // session file (a resumed session, a subagent transcript), and those
+    // are separate billable events.
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        // A malformed line is skipped, never fatal to the file.
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+
+        let usage = entry
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .or_else(|| entry.get("usage"));
+        let Some(usage) = usage else { continue };
+
+        let key = entry
+            .get("requestId")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("message").and_then(|m| m.get("id")).and_then(Value::as_str))
+            .or_else(|| entry.get("uuid").and_then(Value::as_str));
+        if let Some(key) = key {
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
+        }
+
+        // An entry without a readable timestamp belongs to no day, so no
+        // window can count it.
+        let Some(date) = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local).date_naive())
+        else {
+            continue;
+        };
+
+        let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
+
+        let model = entry
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && !m.starts_with('<'))
+            .unwrap_or("");
+
+        let (cache_write_5m, cache_write_1h) = extract_cache_write(usage);
+        let counters = DailyCounters {
+            input: get_u64(usage, "input_tokens"),
+            output: get_u64(usage, "output_tokens"),
+            cache_read: get_u64(usage, "cache_read_input_tokens"),
+            cache_write_5m,
+            cache_write_1h,
+            reasoning: usage
+                .get("output_tokens_details")
+                .map(|d| get_u64(d, "thinking_tokens"))
+                .unwrap_or(0),
+            entries: 1,
+            model: model.to_string(),
+        };
+        out.entries
+            .entry((date, cwd, counters.model.clone()))
+            .or_insert_with(|| DailyCounters { model: counters.model.clone(), ..Default::default() })
+            .add(&counters);
+    }
+    Some(out)
+}
+
 /// The window report for the local dates in `[start, end)`. Each bucket is
-/// priced with its own model and the amounts summed (see `DailyBuckets::fold`).
+/// priced with its own model and the amounts summed (see `DailyBuckets::fold`),
+/// and each project reported under its alias.
 pub fn report(
     daily: &ClaudeDaily,
     start: NaiveDate,
     end: NaiveDate,
     overrides: &pricing::PriceOverrides,
+    aliases: &ProjectAliases,
 ) -> AgentUsageReport {
     // With no session file left, the ledger may still hold days to fold.
     if daily.files_scanned == 0 && daily.buckets.iter().next().is_none() {
@@ -186,13 +197,8 @@ pub fn report(
         pricing::estimate_cost(&c.model, c.input, c.output, c.cache_read, c.cache_write_5m, c.cache_write_1h, overrides)
             .amount
     };
-    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
-    let excluded: u64 = daily.excluded.range(start..end.max(start)).map(|(_, n)| n).sum();
-
-    let mut detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
-    if excluded > 0 {
-        detail.push_str(&format!(" - {excluded} entries outside any project not counted"));
-    }
+    let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent, aliases);
+    let detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
     AgentUsageReport::ok(AGENT, fold.totals, fold.projects, detail)
 }
 
@@ -519,12 +525,45 @@ mod tests {
         assert_eq!(unpriced.totals.cost_basis, None);
     }
 
-    /// Entries whose cwd is scratch (under the temp dir) or a folder outside
-    /// any repository are not counted anywhere: not in the project rows and
-    /// not in the totals, so the split still sums to the totals. An entry with
-    /// no cwd cannot be judged and stays in the totals.
+    /// Two models in one day and project are priced each at its own rate, and
+    /// the row names the model with the most output tokens.
     #[test]
-    fn entries_outside_any_project_are_left_out_of_totals_and_rows() {
+    fn a_day_mixing_two_models_prices_each_at_its_own_rate() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = format!(
+            "{}\n{}\n",
+            priced_line("opus", &noon(14), &cwd, "claude-opus-5", 0, 2_000_000),
+            priced_line("sonnet", &noon(14), &cwd, "claude-sonnet-5", 0, 1_000_000),
+        );
+        fs::write(sessions.join("session.jsonl"), content).unwrap();
+
+        let (start, end) = window();
+        let overrides = pricing::PriceOverrides::default();
+        let report = read_usage(&sessions, start, end, &overrides, &mut fixture_cache(dir.path()));
+
+        let price = |model: &str, output: u64| {
+            pricing::estimate_cost(model, 0, output, 1_000_000, 1_000_000, 1_000_000, &overrides).amount.expect("priced")
+        };
+        let expected = ((price("claude-opus-5", 2_000_000) + price("claude-sonnet-5", 1_000_000)) * 10_000.0).round() / 10_000.0;
+        assert_eq!(report.totals.entries, 2);
+        assert_eq!(report.totals.output_tokens, 3_000_000);
+        assert_eq!(report.totals.cost, Some(expected), "each model at its own rate");
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].totals, report.totals);
+        assert_eq!(report.projects[0].model, "claude-opus-5", "the model with the most output");
+    }
+
+    /// Entries whose cwd is scratch (under the temp dir), a folder outside
+    /// any repository, or missing all count in the totals and in one
+    /// "Outside projects" row with an empty path, so the rows still sum to
+    /// the totals.
+    #[test]
+    fn entries_outside_any_project_count_in_the_outside_projects_row() {
         use crate::usage::RootPolicy;
         let dir = tempdir().unwrap();
         let temp = dir.path().join("Temp");
@@ -549,11 +588,16 @@ mod tests {
         let (start, end) = window();
         let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut cache);
 
-        assert_eq!(report.totals.entries, 2, "the kept entry and the one with no cwd");
-        assert_eq!(report.totals.output_tokens, 15);
-        assert_eq!(report.projects.len(), 1);
-        assert_eq!(report.projects[0].name, "kept-app");
-        assert_eq!(report.projects[0].totals.output_tokens, 10);
-        assert!(report.detail.contains("2 entries outside any project not counted"), "{}", report.detail);
+        assert_eq!(report.totals.entries, 4, "every entry counts");
+        assert_eq!(report.totals.output_tokens, 1215);
+        assert!(report.totals.cost.is_some());
+        let names: Vec<(&str, &str, u64)> =
+            report.projects.iter().map(|p| (p.name.as_str(), p.path.as_str(), p.totals.output_tokens)).collect();
+        assert_eq!(names[0], ("Outside projects", "", 1205), "sorted by output like any row");
+        assert_eq!(names[1].0, "kept-app");
+        assert_eq!(report.projects.len(), 2);
+        assert_eq!(report.projects.iter().map(|p| p.totals.entries).sum::<u64>(), report.totals.entries);
+        assert_eq!(report.projects.iter().map(|p| p.totals.output_tokens).sum::<u64>(), report.totals.output_tokens);
+        assert!(!report.detail.contains("not counted"), "{}", report.detail);
     }
 }
