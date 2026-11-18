@@ -82,8 +82,8 @@ config directory.
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
 | Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
-| Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket on its own |
-| Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
+| Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key, model)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket at its own model |
+| Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged per `(date, project)` group with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
 ## Interaction model
@@ -140,28 +140,33 @@ config directory.
    the others. Pi is the one reader that takes another's data: its
    `claude-bridge` turns are Claude Code sessions, also in Claude's
    transcripts with no shared id, so `pi::read_daily` counts one only for a
-   `(date, project)` that Claude's daily buckets lack, and the report's
+   `(date, project)` that Claude's daily buckets lack (for any model), and the report's
    `detail` says how many it left out. Every other Pi provider always
    counts.
 4. Claude, Codex and Pi totals are priced through `pricing::estimate_cost`
    against the built-in table plus any `pricing.json` overrides; OpenCode
    already carries its own reported cost and skips pricing entirely.
    Claude and Pi entries carry their own timestamps, so their `read_daily`
-   sorts them into `(local date, project key)` buckets of raw counters plus
-   the bucket's last model (`usage::daily`), and their `report` folds the
-   window's dates: each bucket is priced with its own model and the amounts
-   summed, so a total's cost is missing only when no bucket in it has a
-   price.
+   sorts them into `(local date, project key, model)` buckets of raw
+   counters (`usage::daily`), and their `report` folds the window's dates:
+   each bucket is priced at its own model and the amounts summed, so two
+   models on one day each cost their own rate and a total's cost is missing
+   only when no bucket in it has a price. A project row names the model with
+   the most output tokens in the window.
 5. Before folding, the claude and pi buckets are merged with the ledger
    (`usage::ledger::Session`, which holds a process-wide lock from the load
-   to the write). Per `(agent, date, project)` the bucket with more entries
-   wins, the agent's files on a tie, and a day only the ledger has still
-   counts, so a transcript Claude Code deleted after `cleanupPeriodDays`
-   stays in the history. Claude is merged first and its merged buckets go
+   to the write). Per `(agent, date, project)` group (every model of that
+   day) the side with more entries keeps all of its model buckets and the
+   other side's are dropped, the agent's files on a tie, and a day only the
+   ledger has still counts, so a transcript Claude Code deleted after
+   `cleanupPeriodDays` stays in the history. Comparing whole groups is what
+   keeps a version 1 record (one per day and project, named after the last
+   model) and the per-model buckets read now from both counting. Claude is merged first and its merged buckets go
    to pi, so the `claude-bridge` check also sees the days only the ledger
    has. Records older than 365 days are pruned, and the file is written
-   (temp file plus rename) only when this call changed it. The ledger holds
-   raw counters and the model, never a cost. A file that cannot be read,
+   (temp file plus rename) only when this call changed it or it is version 1,
+   which loads as is and is saved as version 2 (one record per model). The
+   ledger holds raw counters and the model, never a cost. A file that cannot be read,
    does not parse or has an unknown version is left untouched: that call
    uses the agents' files only and the claude and pi `detail` say why; a
    failed write is reported the same way and never fails `get_usage`.

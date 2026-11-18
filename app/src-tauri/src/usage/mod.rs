@@ -908,13 +908,37 @@ mod tests {
         assert_eq!(reread.buckets("claude").iter().count(), 2, "a new day is written");
     }
 
+    /// A version 1 ledger is read as is and rewritten as version 2 by the
+    /// next collect, with the same records and the same totals.
+    #[test]
+    fn a_version_1_ledger_is_rewritten_as_version_2_with_the_same_totals() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let v1 = ledger_file(&[("2026-09-01", 9, 900), ("2026-09-14", 2, 20)]);
+        std::fs::write(&ledger, &v1).unwrap();
+
+        let first = home.collect(Some(&ledger));
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_str(&v1).unwrap();
+        expected["version"] = 2.into();
+        assert_eq!(json, expected, "same records, version 2");
+
+        let second = home.collect(Some(&ledger));
+        let claude = &first.agents[0];
+        assert_eq!(claude.totals.entries, 11);
+        assert_eq!(claude.totals.output_tokens, 920);
+        assert!(claude.totals.cost.is_some());
+        assert_eq!(second.agents[0].totals, claude.totals, "the v2 file gives the same totals");
+    }
+
     /// A ledger Orbitbar cannot use is never overwritten: the call reads the
     /// agents' files only and the claude and pi details say why.
     #[test]
     fn a_corrupt_or_unknown_version_ledger_is_left_untouched() {
         for (content, reason) in [
             ("{ not json".to_string(), "not a valid ledger"),
-            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":2"#), "unknown version 2"),
+            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":3"#), "unknown version 3"),
         ] {
             let home = LedgerHome::new();
             let ledger = home.ledger();

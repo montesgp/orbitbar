@@ -519,6 +519,39 @@ mod tests {
         assert_eq!(unpriced.totals.cost_basis, None);
     }
 
+    /// Two models in one day and project are priced each at its own rate, and
+    /// the row names the model with the most output tokens.
+    #[test]
+    fn a_day_mixing_two_models_prices_each_at_its_own_rate() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let content = format!(
+            "{}\n{}\n",
+            priced_line("opus", &noon(14), &cwd, "claude-opus-5", 0, 2_000_000),
+            priced_line("sonnet", &noon(14), &cwd, "claude-sonnet-5", 0, 1_000_000),
+        );
+        fs::write(sessions.join("session.jsonl"), content).unwrap();
+
+        let (start, end) = window();
+        let overrides = pricing::PriceOverrides::default();
+        let report = read_usage(&sessions, start, end, &overrides, &mut fixture_cache(dir.path()));
+
+        let price = |model: &str, output: u64| {
+            pricing::estimate_cost(model, 0, output, 1_000_000, 1_000_000, 1_000_000, &overrides).amount.expect("priced")
+        };
+        let expected = ((price("claude-opus-5", 2_000_000) + price("claude-sonnet-5", 1_000_000)) * 10_000.0).round() / 10_000.0;
+        assert_eq!(report.totals.entries, 2);
+        assert_eq!(report.totals.output_tokens, 3_000_000);
+        assert_eq!(report.totals.cost, Some(expected), "each model at its own rate");
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].totals, report.totals);
+        assert_eq!(report.projects[0].model, "claude-opus-5", "the model with the most output");
+    }
+
     /// Entries whose cwd is scratch (under the temp dir) or a folder outside
     /// any repository are not counted anywhere: not in the project rows and
     /// not in the totals, so the split still sums to the totals. An entry with

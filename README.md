@@ -317,9 +317,9 @@ projects** under the list expands it to every project in the window.
 
 Claude Code deletes session files older than its `cleanupPeriodDays` setting
 (30 days unless you change it in `~/.claude/settings.json`), so their usage
-would drop out of the panel. Orbitbar keeps daily totals per project for
-Claude Code and Pi in `usage-ledger.json`, next to `config.json`, and keeps
-them for 365 days. It holds token counts and the model only; costs are
+would drop out of the panel. Orbitbar keeps daily totals per project and
+model for Claude Code and Pi in `usage-ledger.json`, next to `config.json`,
+and keeps them for 365 days. It holds token counts and the model only; costs are
 computed when the panel opens, so `pricing.json` still applies. Codex and
 OpenCode keep their whole history in their own stores, so they are not in it.
 
