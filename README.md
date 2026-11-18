@@ -4,7 +4,7 @@
 
 Orbitbar is a small bar that stays where you put it on your screen, always
 visible above your other windows. It shows the token usage and cost of your local AI
-coding agents (Claude Code, Codex and OpenCode): overall, per project, and
+coding agents (Claude Code, Codex, OpenCode and Pi): overall, per project, and
 for the time window you pick. It runs on Windows, macOS and Linux.
 
 | Dark | Light |
@@ -18,10 +18,14 @@ for the time window you pick. It runs on Windows, macOS and Linux.
   collapses to a small tab, and opens a usage panel and a menu beside it, on
   whichever side has room. Only one Orbitbar runs at a time.
 - **Usage per agent and per project.** Output tokens and cost for Today,
-  the last 7 days, the last 30 days or the current month.
+  the last 7 days, the last 30 days, the current month or the last 365 days.
 - **Local data only.** Orbitbar reads the session history your agents
-  already keep on disk. It needs no account, sends no telemetry and makes no
-  network calls.
+  already keep on disk. It needs no account and sends no telemetry. Its one
+  network call is the update check against this repository's GitHub
+  Releases, which you can turn off. See [Updating](#updating).
+- **A year of history.** Orbitbar keeps its own daily totals for Claude Code
+  and Pi, so usage stays visible after an agent deletes old sessions. See
+  [History](#history).
 - **Sourced prices.** A built-in price table with a per-user override file.
   A model without a price entry shows `no price data`.
 - **Light and dark themes**, switched live from the bar's menu.
@@ -40,17 +44,39 @@ the file for your OS:
 | OS | File to pick |
 | --- | --- |
 | Windows | `Orbitbar_<version>_x64-setup.exe` (recommended) or `Orbitbar_<version>_x64_en-US.msi` |
+| Windows on Arm | `Orbitbar_<version>_arm64-setup.exe` or `Orbitbar_<version>_arm64_en-US.msi` (the x64 installers also run, through emulation) |
 | macOS | `Orbitbar_<version>_universal.dmg` (Apple silicon and Intel) |
 | Linux | `Orbitbar_<version>_amd64.AppImage` (run it directly), `.deb` (Debian, Ubuntu) or `.rpm` (Fedora, openSUSE) |
+| Linux on ARM64 | `Orbitbar_<version>_aarch64.AppImage`, `Orbitbar_<version>_arm64.deb` or `Orbitbar-<version>-1.aarch64.rpm` |
+
+The download page picks the ARM64 build when the browser reports an Arm
+processor (Chrome and Edge do; Firefox does on Linux). Otherwise it offers the
+x64 build and links the ARM64 files below the button.
 
 Agents are optional: Orbitbar reads whichever of Claude Code, Codex and
 OpenCode are installed and reports the others as not installed. SQLite is
 compiled into the binary, so there is nothing else to install.
 
-**Updating:** Orbitbar does not update itself yet. To move to a newer
-version, close the bar and run the installer from the latest release; your
-`config.json` is kept. The [roadmap](#roadmap) tracks in-app update
-notifications.
+### Updating
+
+From 0.3.0 on, Orbitbar updates itself. About 30 seconds after it starts,
+and then every 6 hours, it downloads `latest.json` from this repository's
+[latest release](https://github.com/montesgp/orbitbar/releases/latest). When
+that names a newer version, Orbitbar downloads it, checks its signature
+against the project's updater key, installs it and restarts. An update that
+is not signed with that key is never installed. Nothing else is sent or
+received.
+
+- Updates are on by default. Turn them off with **Automatic updates** in the
+  bar's menu, or set `autoUpdate` to `false` in `config.json`. The change
+  applies from the next check, without a restart.
+- On Windows the update runs the installer in passive mode: a progress
+  window shows briefly, with no questions.
+- On Linux only the AppImage updates itself. A `.deb` or `.rpm` install is
+  updated like any other package: install the new one from the latest
+  release with your package manager.
+- Versions before 0.3.0 do not update themselves: close the bar and run the
+  installer from the latest release once. Your `config.json` is kept.
 
 ### First run: unsigned installers
 
@@ -115,6 +141,14 @@ npm run tauri build   # installer or app bundle for the current OS
 
 Use `npm run tauri dev` instead to run with hot reload while you work on it.
 
+The installer build also signs the update bundles, so without the project's
+updater key (`TAURI_SIGNING_PRIVATE_KEY`) `npm run tauri build` fails at
+the signing step. Skip the update bundles with
+`npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'`,
+or build only the binary with `npx tauri build --no-bundle`. A copy you
+build yourself still checks this repository's releases for updates unless
+you turn **Automatic updates** off.
+
 `npm run tauri build` writes the installers under
 `app/src-tauri/target/release/bundle/`, in one folder per format
 (`nsis`, `msi`, `dmg`, `macos`, `deb`, `rpm`, `appimage`). Each OS produces
@@ -124,13 +158,14 @@ its own formats; build on the OS you are targeting. See
 ## Using Orbitbar
 
 - **Click an agent cell** to open its usage panel. The panel always opens on
-  Today; its selector switches to 7 days, 30 days or this month while the
+  Today; its selector switches to 7 days, 30 days, this month or 365 days while the
   panel is open. Click the same cell again, press Escape, or use the close
   button to close it.
 - **Right-click the bar** (or the collapsed tab), or **left-click the
   settings cell**, for the menu: edit `config.json`, open `pricing.json`,
   collapse or expand, reload the config without a restart, switch between
-  Light and Dark, turn **Start with system** or **Show example action** on or off, or quit. Escape or a click outside closes the menu.
+  Light and Dark, turn **Start with system**, **Automatic updates** or
+  **Show example action** on or off, or quit. Escape or a click outside closes the menu.
 - **Drag the bar** to move it anywhere; it stays where you drop it, keeps
   inside the monitor's usable area (not under the taskbar) and comes back
   there after a restart. The panel and the menu open on the bar's left, or on
@@ -171,6 +206,7 @@ Orbitbar creates `config.json` with defaults on first launch (paths per OS in
 | `position` | Where the bar was dropped: `{ "x": 1836, "y": 340 }`, its top-left corner in physical screen pixels (negative on a monitor left of or above the primary). Written when you drag the bar or collapse/expand it; absent until then. Read at startup: a position that is partly off-screen is pulled back in, one that is off every monitor is ignored and the bar goes to the right edge of `monitor`. Delete the field to reset the placement. |
 | `collapsed` | Whether the bar starts as the small tab. |
 | `autoStart` | Start Orbitbar at login (on by default; release builds only). The menu's **Start with system** entry changes it for you: its check mark shows the real OS registration, and selecting it updates the OS entry and this field. |
+| `autoUpdate` | Check this repository's GitHub Releases for a signed update and install it (on by default; release builds only, and on Linux only the AppImage). The menu's **Automatic updates** entry changes it for you. See [Updating](#updating). |
 | `showExamples` | Show the example cells (items flagged `"example": true`). Off by default. The menu's **Show example action** entry changes it for you. |
 | `items` | The cells on the bar, each with `id`, `glyph`, `label`, `tooltip` and `action`, and optionally `"example": true`. |
 
@@ -178,8 +214,8 @@ Item actions:
 
 | Action | What it does |
 | --- | --- |
-| `agent-usage` | Opens the usage panel with all three agents. |
-| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode` | Opens the panel for one agent. |
+| `agent-usage` | Opens the usage panel with every agent. |
+| `agent-usage:claude`, `agent-usage:codex`, `agent-usage:opencode`, `agent-usage:pi` | Opens the panel for one agent. Pi has no cell of its own by default. |
 | `toggle-autostart` | Turns autostart on or off and updates the OS entry. |
 | `edit-config` | Opens the bar's menu at the click; "Edit config" there opens `config.json` in your default editor. |
 | `open:<url>` | Opens an `http://` or `https://` URL in your default browser. Other schemes are rejected and the panel shows why. |
@@ -254,9 +290,15 @@ with a warning.
 | Claude Code | `~/.claude/projects/**/*.jsonl` | Read-only |
 | Codex | `~/.codex/sessions/**/*.jsonl` | Read-only |
 | OpenCode | `~/.local/share/opencode/opencode.db` | Read-only SQLite |
+| Pi | `~/.pi/agent/sessions/**/*.jsonl` | Read-only |
 
 `~` is your home directory on every OS. See
 [docs/architecture.md](docs/architecture.md) for how the readers work.
+
+Pi turns run through its `claude-bridge` provider are Claude Code sessions,
+so Claude Code's own files hold them too. Pi counts them only for a day and
+project that Claude has no usage for, and its panel says how many it left
+out; turns from every other Pi provider always count.
 
 Usage is grouped by project: the repository a session ran in. Runs that are
 not part of a project are not counted, neither in the project list nor in the
@@ -264,7 +306,26 @@ agent totals: sessions started in your operating system's temporary folder
 (for example a tool that spawns short-lived agent runs there), and sessions
 started in a folder that is not inside any Git repository (such as your home
 folder). A project whose folder was renamed or deleted still appears, as one
-row named after the folder that is gone.
+row named after the folder that is gone. A repository reached through two
+paths (for example through a Windows junction or a symbolic link) is one
+project, named by the path the link points to.
+
+Each agent lists its 5 busiest projects by output tokens; **Show all N
+projects** under the list expands it to every project in the window.
+
+### History
+
+Claude Code deletes session files older than its `cleanupPeriodDays` setting
+(30 days unless you change it in `~/.claude/settings.json`), so their usage
+would drop out of the panel. Orbitbar keeps daily totals per project for
+Claude Code and Pi in `usage-ledger.json`, next to `config.json`, and keeps
+them for 365 days. It holds token counts and the model only; costs are
+computed when the panel opens, so `pricing.json` still applies. Codex and
+OpenCode keep their whole history in their own stores, so they are not in it.
+
+`usage-ledger.json` is the only file Orbitbar writes for usage; the agents'
+files above are only read. If the ledger cannot be read, Orbitbar leaves it
+as it is, shows the agents' own data only and says so in the panel.
 
 ## Extensions
 
@@ -276,8 +337,7 @@ bar. See [extensions/README.md](extensions/README.md).
 
 Planned work is tracked as GitHub issues labeled
 [`enhancement`](https://github.com/montesgp/orbitbar/issues?q=is%3Aissue+label%3Aenhancement).
-Next up: an update notice in the bar's menu when a newer release is
-available, with a link to it, and later an in-app update.
+Automatic updates shipped in 0.3.0 (see [Updating](#updating)).
 
 ## Contributing
 

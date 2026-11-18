@@ -27,6 +27,11 @@ pub struct AppConfig {
     /// serde default, a config written before this field existed simply gets
     /// true rather than failing to parse.
     pub auto_start: bool,
+    /// Whether Orbitbar checks GitHub Releases for a signed update and installs
+    /// it (see `start_update_checks` in lib.rs). On by default, including for a config
+    /// written before this field existed; read again on every check, so the
+    /// menu toggle takes effect without a restart.
+    pub auto_update: bool,
     /// Whether items flagged `example` are shown. Off by default: examples
     /// only demonstrate what a cell can do, they are not part of the user's bar.
     pub show_examples: bool,
@@ -56,6 +61,7 @@ impl Default for AppConfig {
             theme: "dark".into(),
             font_size: 10.0,
             auto_start: true,
+            auto_update: true,
             show_examples: false,
             position: None,
             items: default_items(),
@@ -240,6 +246,19 @@ pub fn save(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
 /// callers outside this module (the `get_usage` command, to find
 /// `pricing.json` next to `config.json`) can reuse the exact same directory
 /// resolution instead of re-deriving it.
+/// `autoUpdate` from the config at `path`, for the background update check.
+/// Read-only, unlike `load`: it never creates, repairs or renames the file,
+/// because a thread the user never triggered must not reset a config they are
+/// editing. A missing file or field is the default (on); a file that cannot
+/// be read or parsed is `None`, which skips that check.
+pub fn read_auto_update(path: &std::path::Path) -> Option<bool> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<AppConfig>(&raw).ok().map(|cfg| cfg.auto_update),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(AppConfig::default().auto_update),
+        Err(_) => None,
+    }
+}
+
 pub fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let resolver = app.path();
     let dir = resolver
@@ -292,7 +311,7 @@ pub fn ensure_pricing_file(path: &PathBuf) -> Result<(), String> {
 }
 
 fn default_items() -> Vec<Item> {
-    let tooltip = "none | agent-usage | agent-usage:claude | agent-usage:codex | agent-usage:opencode | open:<url> | run:<program> [args] | panel:<program> [args] | edit-config";
+    let tooltip = "none | agent-usage | agent-usage:claude | agent-usage:codex | agent-usage:opencode | agent-usage:pi | open:<url> | run:<program> [args] | panel:<program> [args] | edit-config";
     vec![
         Item {
             id: "claude".into(),
@@ -323,7 +342,7 @@ fn default_items() -> Vec<Item> {
             label: "usage".into(),
             glyph: "0x0024".into(),
             action: "agent-usage".into(),
-            tooltip: "Live session usage (claude/codex/opencode) - real-time balance".into(),
+            tooltip: "Live session usage (claude/codex/opencode/pi) - real-time balance".into(),
             example: false,
         },
         Item {
@@ -498,6 +517,52 @@ mod tests {
         assert!(!cfg.auto_start);
     }
 
+    /// Automatic updates are on by default, and a config written before
+    /// `autoUpdate` existed gets true too, so an upgraded install keeps
+    /// receiving updates without the user opting in.
+    /// The background update check reads `autoUpdate` without ever writing
+    /// the file: a config the user is mid-way through editing must not be
+    /// renamed to `.invalid` and reset by a thread they never triggered.
+    #[test]
+    fn the_update_check_reads_auto_update_without_writing_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        assert_eq!(read_auto_update(&path), Some(true), "missing file: the default");
+        assert!(!path.exists(), "a missing file is not created");
+
+        std::fs::write(&path, r#"{ "autoUpdate": false }"#).unwrap();
+        assert_eq!(read_auto_update(&path), Some(false));
+
+        std::fs::write(&path, r#"{ "theme": "light" }"#).unwrap();
+        assert_eq!(read_auto_update(&path), Some(true), "field missing: the default");
+
+        let broken = r#"{ "autoUpdate": false, "theme": "#;
+        std::fs::write(&path, broken).unwrap();
+        assert_eq!(read_auto_update(&path), None, "invalid JSON: skip the check");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "left byte-for-byte");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no .invalid copy, no new file");
+    }
+
+    #[test]
+    fn auto_update_is_on_by_default_and_for_a_config_without_the_field() {
+        assert!(AppConfig::default().auto_update);
+        let cfg: AppConfig = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(cfg.auto_update, "an older config must opt in to updates, not out of them");
+    }
+
+    /// The menu toggle writes `autoUpdate`; an explicit false must survive a
+    /// save and a reload, under the camelCase key the frontend sends.
+    #[test]
+    fn an_explicit_auto_update_false_round_trips() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"autoUpdate":false}"#).unwrap();
+        assert!(!cfg.auto_update);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""autoUpdate":false"#), "{json}");
+        let again: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!again.auto_update);
+    }
+
     /// The usage panel always opens on Today and the selector is never
     /// persisted, so `usageWindow` is not part of the schema any more.
     #[test]
@@ -562,6 +627,18 @@ mod tests {
         let pos = pos.expect("default items must carry the GitHub cell");
         assert_eq!(items[pos].id, "github");
         assert_eq!(items[pos + 1].id, "settings");
+    }
+
+    /// Pi has no default cell, so the agent cells' tooltips are where the
+    /// `agent-usage:pi` action is listed; the default cells stay the same.
+    #[test]
+    fn the_agent_cell_tooltips_list_the_pi_action_without_a_pi_cell() {
+        let items = default_items();
+        for id in ["claude", "codex", "opencode"] {
+            let item = items.iter().find(|i| i.id == id).expect("agent cell");
+            assert!(item.tooltip.contains("agent-usage:opencode | agent-usage:pi |"), "{}", item.tooltip);
+        }
+        assert!(items.iter().all(|i| i.action != "agent-usage:pi"));
     }
 
     /// The default set must stay usable: the bar renders nothing if there is

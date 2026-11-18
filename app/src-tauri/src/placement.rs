@@ -60,6 +60,16 @@ pub struct Placement {
     pub bar_offset: Point,
 }
 
+/// A size in CSS (logical) pixels converted to physical pixels with a monitor's
+/// scale factor, rounded to whole pixels. The bar's 72x400 and the panel and
+/// menu widths are CSS pixels; every window rectangle here is physical, so on
+/// a scale-2 Retina screen the bar needs a 144x800 window. A missing or
+/// nonsensical factor counts as 1. Mirrors `cssToPhysical` in the frontend.
+pub fn physical_size(size: (u32, u32), scale: f64) -> (u32, u32) {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    ((size.0 as f64 * scale).round() as u32, (size.1 as f64 * scale).round() as u32)
+}
+
 /// Top-left of a window of `size` snapped to the right edge of a monitor,
 /// vertically centered, `margin` physical pixels in from the edge. Pure so the
 /// snap rule is testable; `monitor` is `(x, y, width, height)`. This is only the
@@ -192,6 +202,26 @@ mod tests {
     fn assert_bar_fixed(p: Placement) {
         assert_eq!(p.window.x + p.bar_offset.x, p.bar.x, "{p:?}");
         assert_eq!(p.window.y + p.bar_offset.y, p.bar.y, "{p:?}");
+    }
+
+    // ---- CSS to physical sizes ----
+
+    /// On a Retina Mac (scale 2) the 72x400 CSS bar needs a 144x800 window;
+    /// sizing it 72x400 physical clipped the bar and cut the panel in half.
+    #[test]
+    fn a_css_size_scales_to_physical_pixels() {
+        assert_eq!(physical_size(BAR, 1.0), (72, 400));
+        assert_eq!(physical_size(BAR, 2.0), (144, 800));
+        assert_eq!(physical_size(TAB, 1.5), (69, 69));
+        assert_eq!(physical_size(TAB, 1.25), (58, 58));
+    }
+
+    /// A missing or nonsensical factor counts as 1, like `physicalToCss`.
+    #[test]
+    fn a_nonsensical_scale_factor_counts_as_one() {
+        assert_eq!(physical_size(BAR, 0.0), BAR);
+        assert_eq!(physical_size(BAR, -2.0), BAR);
+        assert_eq!(physical_size(BAR, f64::NAN), BAR);
     }
 
     // ---- first-launch placement ----

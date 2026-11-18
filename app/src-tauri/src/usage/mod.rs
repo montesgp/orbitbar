@@ -1,16 +1,19 @@
-//! Token-spend usage readers: claude, codex and opencode, each read from the
+//! Token-spend usage readers: claude, codex, opencode and pi, each read from the
 //! agent's own local files, no external service or program involved. The
 //! per-agent modules below own the deduplication, cumulative-vs-summed
 //! counter handling and windowing each store needs.
 //!
 //! One function, [`collect_usage`], returns a per-agent breakdown for a time
 //! window plus a per-project split sorted by output tokens. A broken or
-//! missing store on one agent never hides the other two: each carries its own
+//! missing store on one agent never hides the others: each carries its own
 //! [`AgentStatus`].
 
 pub mod claude;
 pub mod codex;
+pub mod daily;
+pub mod ledger;
 pub mod opencode;
+pub mod pi;
 pub mod pricing;
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone};
@@ -29,11 +32,13 @@ pub enum TimeWindow {
     Last7Days,
     Last30Days,
     ThisMonth,
+    Last365Days,
 }
 
 /// Resolves a window to a local `[start, end)` instant pair. All windows are
 /// full-day boundaries at local midnight, so "last 7 days" always means 7
-/// whole days including today, never a rolling 168-hour clock.
+/// whole days including today, never a rolling 168-hour clock, and "365 days"
+/// is today plus the previous 364 days.
 pub fn window_range(window: TimeWindow, now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
     let today_start = now
         .date_naive()
@@ -69,6 +74,35 @@ pub fn window_range(window: TimeWindow, now: DateTime<Local>) -> (DateTime<Local
                 .unwrap_or(month_start);
             (month_start, next_month_start)
         }
+        TimeWindow::Last365Days => {
+            // Counted in calendar days, not 364 x 24 hours, so a daylight-
+            // saving change inside the year never moves the start off midnight.
+            let start_naive = today_start.date_naive() - Duration::days(364);
+            let start = Local
+                .from_local_datetime(&start_naive.and_hms_opt(0, 0, 0).unwrap())
+                .earliest()
+                .unwrap_or(today_start - Duration::days(364));
+            (start, tomorrow_start)
+        }
+    }
+}
+
+/// Strips the `\\?\` verbatim prefix `std::fs::canonicalize` adds on Windows
+/// (`\\?\UNC\server\share` becomes `\\server\share`), leaving any other path as is.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
+}
+
+/// `path` as the file system resolves it (junctions, symlinks, 8.3 short
+/// names, letter case), or `path` itself when it cannot be resolved.
+fn resolved_dir(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => PathBuf::from(strip_verbatim_prefix(&resolved.to_string_lossy())),
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -172,7 +206,7 @@ impl AgentUsageReport {
     }
 }
 
-/// The three store roots, resolved from a home directory. Readers take their
+/// The agents' store roots, resolved from a home directory. Readers take their
 /// root as a parameter (never resolve it themselves) so tests can point them
 /// at fixtures.
 #[derive(Debug, Clone)]
@@ -180,9 +214,10 @@ pub struct UsagePaths {
     pub claude_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub opencode_db: PathBuf,
+    pub pi_dir: PathBuf,
 }
 
-/// Resolves the three store roots under a home directory. `home_override`
+/// Resolves the store roots under a home directory. `home_override`
 /// lets tests and the parity harness point at a fixture home instead of the
 /// real one; the ordinary caller passes `None` and gets `dirs::home_dir()`.
 ///
@@ -204,6 +239,7 @@ pub fn resolve_paths(home_override: Option<&Path>) -> Option<UsagePaths> {
             .join("share")
             .join("opencode")
             .join("opencode.db"),
+        pi_dir: home.join(".pi").join("agent").join("sessions"),
     })
 }
 
@@ -249,7 +285,7 @@ pub fn project_display_name(key: &str) -> String {
 /// codex and opencode all report many sessions that share the same cwd
 /// (subagents, resumed sessions, several projects under one parent), so a
 /// shared cache means the filesystem is walked at most once per distinct
-/// cwd across all three readers, not once per session.
+/// cwd across all the readers, not once per session.
 pub struct ProjectRootCache {
     policy: RootPolicy,
     resolved: HashMap<String, Option<String>>,
@@ -272,12 +308,9 @@ impl RootPolicy {
     /// an agent recorded the long one; macOS reports `/var` for `/private/var`).
     pub fn system() -> Self {
         let mut temp_dirs = vec![std::env::temp_dir()];
-        if let Ok(resolved) = std::fs::canonicalize(&temp_dirs[0]) {
-            let text = resolved.to_string_lossy();
-            let resolved = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
-            if resolved != temp_dirs[0] {
-                temp_dirs.push(resolved);
-            }
+        let resolved = resolved_dir(&temp_dirs[0]);
+        if resolved != temp_dirs[0] {
+            temp_dirs.push(resolved);
         }
         Self { temp_dirs, home: dirs::home_dir() }
     }
@@ -314,6 +347,9 @@ impl Default for ProjectRootCache {
 /// 2. Otherwise the root is the nearest ancestor directory (including `cwd`
 ///    itself, or its nearest surviving ancestor when `cwd` was deleted) that
 ///    contains a `.git` entry; the walk never climbs into the home directory.
+///    The walk runs on the path as the file system resolves it (junctions,
+///    symlinks, 8.3 short names), so `C:\repositories\x` reached through a
+///    junction to `R:\repositories\x` gives the same key as the target.
 /// 3. With no repository found: an existing `cwd` (the home directory, a plain
 ///    folder) is excluded; a missing `cwd` belongs to a repository that was
 ///    renamed or deleted, and is keyed by the topmost missing directory, the
@@ -384,22 +420,45 @@ fn resolve_project_root_uncached(cwd: &str, policy: &RootPolicy) -> Option<Strin
         }
     }
 
+    // From here the walk runs on resolved paths: the surviving directory
+    // through junctions and symlinks, and the temp and home boundaries in
+    // their resolved form too, so a link never slips past either.
+    let resolved_start = PathBuf::from(normalize_project_path(&resolved_dir(start).to_string_lossy()));
+    // The missing part is rebuilt on top of the resolved ancestor, so a
+    // deleted repo reached through a link keeps the key it had while it
+    // existed (the ledger stores days under that key).
+    let top_missing = top_missing.map(|missing| match missing.strip_prefix(start) {
+        Ok(suffix) => resolved_start.join(suffix),
+        Err(_) => missing.to_path_buf(),
+    });
+    let start = resolved_start;
+    if top_missing.is_none() {
+        let resolved_cwd = start.to_string_lossy();
+        if policy.temp_dirs.iter().any(|temp| is_within(&resolved_cwd, &resolved_dir(temp))) {
+            return None;
+        }
+    }
+
     // Never walk past the user's home directory. Dotfiles managed as a bare
     // git repo directly in $HOME are common, and without this boundary every
     // session cwd that has no repo of its own would silently merge into one
     // giant project named after the home folder instead of falling back to
     // its own path.
-    let home_boundary = policy.home.clone();
+    let home_boundary: Vec<PathBuf> = policy
+        .home
+        .iter()
+        .flat_map(|home| [home.clone(), resolved_dir(home)])
+        .collect();
 
-    let mut current = start;
+    let mut current = start.as_path();
     loop {
-        if home_boundary.as_deref() == Some(current) {
+        if home_boundary.iter().any(|home| home == current) {
             break;
         }
         let git_path = current.join(".git");
         if git_path.is_file() {
             if let Some(main_root) = main_root_from_gitdir_file(&git_path) {
-                return Some(normalize_project_path(&main_root.to_string_lossy()));
+                return Some(normalize_project_path(&resolved_dir(&main_root).to_string_lossy()));
             }
             // Unreadable or malformed gitdir pointer: this directory is
             // still the most honest root we have, rather than failing the
@@ -458,7 +517,7 @@ pub(crate) fn find_jsonl_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// One snapshot of all three agents for a time window - the shape the
+/// One snapshot of every agent for a time window - the shape the
 /// `get_usage` Tauri command returns.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -475,9 +534,17 @@ pub struct UsageSnapshot {
     pub pricing_warning: Option<String>,
 }
 
-/// Reads all three agents for `window`, as of `now`, pricing claude/codex
-/// against `overrides` layered on top of the built-in table (see
-/// `pricing::find_price_entry`). Sequential: three bounded, independent reads
+/// Reads every agent for `window`, as of `now`, in the order claude, codex,
+/// opencode, pi, pricing claude/codex/pi against `overrides` layered on top
+/// of the built-in table (see `pricing::find_price_entry`). Pi reads after
+/// claude because its claude-bridge turns count only where Claude's daily
+/// buckets have no `(date, project)`.
+///
+/// With a `ledger_path`, the claude and pi daily buckets are merged with
+/// Orbitbar's own ledger (see `usage::ledger`) before the window is folded,
+/// so a day an agent has since deleted still counts, and the ledger is
+/// written back when that changed it. `None` reads the agents' files only and
+/// writes nothing (tests, the parity harness). Sequential: bounded, independent reads
 /// are cheaper than the coordination a parallel version would need, and a
 /// broken one never blocks the others because each is wrapped in its own
 /// `AgentUsageReport`.
@@ -486,20 +553,54 @@ pub fn collect_usage(
     paths: &UsagePaths,
     now: DateTime<Local>,
     overrides: &pricing::PriceOverrides,
+    ledger_path: Option<&Path>,
 ) -> UsageSnapshot {
     let (start, end) = window_range(window, now);
+    let (first_day, end_day) = (start.date_naive(), end.date_naive());
     let mut root_cache = ProjectRootCache::new();
 
-    let claude = claude::read_usage(&paths.claude_dir, start, end, overrides, &mut root_cache);
+    let claude_daily = claude::read_daily(&paths.claude_dir, &mut root_cache);
     let codex = codex::read_usage(&paths.codex_dir, start, end, overrides, &mut root_cache);
     let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache);
+
+    // The ledger is locked from here until it is written, so the claude and
+    // pi merges of concurrent calls never interleave.
+    let mut ledger = ledger_path.map(ledger::Session::open);
+
+    // Claude's merged buckets stay around for pi, whose claude-bridge turns
+    // count only where Claude (its files or the ledger) has no bucket.
+    let (mut claude, claude_buckets) = match claude_daily {
+        Ok(mut daily) => {
+            if let Some(ledger) = ledger.as_mut() {
+                daily.buckets = ledger.merge(claude::AGENT, &daily.buckets);
+            }
+            (claude::report(&daily, first_day, end_day, overrides), daily.buckets)
+        }
+        Err(report) => (*report, ledger.as_ref().map(|l| l.stored(claude::AGENT)).unwrap_or_default()),
+    };
+    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &mut root_cache) {
+        Ok(mut daily) => {
+            if let Some(ledger) = ledger.as_mut() {
+                daily.buckets = ledger.merge(pi::AGENT, &daily.buckets);
+            }
+            pi::report(&daily, first_day, end_day, overrides)
+        }
+        Err(report) => *report,
+    };
+
+    if let Some(note) = ledger.and_then(|l| l.finish(now.date_naive())) {
+        for report in [&mut claude, &mut pi] {
+            report.detail.push_str(" - ");
+            report.detail.push_str(&note);
+        }
+    }
 
     UsageSnapshot {
         window,
         window_start: start.to_rfc3339(),
         window_end: end.to_rfc3339(),
         generated_at: now.to_rfc3339(),
-        agents: vec![claude, codex, opencode],
+        agents: vec![claude, codex, opencode, pi],
         pricing_warning: None,
     }
 }
@@ -507,7 +608,7 @@ pub fn collect_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{NaiveDate, TimeZone};
     use tempfile::tempdir;
 
     fn local(y: i32, m: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
@@ -556,6 +657,31 @@ mod tests {
     }
 
     #[test]
+    fn last_365_days_includes_today_and_the_previous_364_days() {
+        let now = local(2026, 9, 28, 8, 0);
+        let (start, end) = window_range(TimeWindow::Last365Days, now);
+        assert_eq!(start, local(2025, 9, 29, 0, 0));
+        assert_eq!(end, local(2026, 9, 29, 0, 0));
+        assert_eq!((end.date_naive() - start.date_naive()).num_days(), 365);
+    }
+
+    #[test]
+    fn last_365_days_serializes_as_last365days() {
+        assert_eq!(serde_json::to_string(&TimeWindow::Last365Days).unwrap(), "\"last365Days\"");
+        let parsed: TimeWindow = serde_json::from_str("\"last365Days\"").unwrap();
+        assert_eq!(parsed, TimeWindow::Last365Days);
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_removes_only_the_verbatim_prefix() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\R:\repositories\orbitbar"), r"R:\repositories\orbitbar");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\server\share\repo"), r"\\server\share\repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\repositories\orbitbar"), r"C:\repositories\orbitbar");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+        assert_eq!(strip_verbatim_prefix("/home/me/orbitbar"), "/home/me/orbitbar");
+    }
+
+    #[test]
     fn default_window_is_today() {
         assert_eq!(TimeWindow::default(), TimeWindow::Today);
     }
@@ -597,6 +723,337 @@ mod tests {
             paths.opencode_db,
             home.join(".local").join("share").join("opencode").join("opencode.db")
         );
+        assert_eq!(paths.pi_dir, home.join(".pi").join("agent").join("sessions"));
+    }
+
+    /// Every agent is reported, in a fixed order with pi last, even when
+    /// none of the stores exist.
+    #[test]
+    fn collect_usage_reports_claude_codex_opencode_then_pi() {
+        let dir = tempdir().unwrap();
+        let paths = resolve_paths(Some(dir.path())).unwrap();
+        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None);
+
+        let agents: Vec<&str> = snapshot.agents.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(agents, vec!["claude", "codex", "opencode", "pi"]);
+        assert!(snapshot.agents.iter().all(|a| a.status == AgentStatus::NotInstalled));
+    }
+
+    /// Pi's `claude-bridge` turns are checked against the Claude buckets of
+    /// the same snapshot: a day Claude has is not counted twice.
+    #[test]
+    fn collect_usage_leaves_out_bridge_turns_claude_already_counts() {
+        let dir = tempdir().unwrap();
+        let paths = resolve_paths(Some(dir.path())).unwrap();
+        let now = local(2026, 9, 15, 18, 0);
+        let ts = |h: u32| local(2026, 9, 15, h, 0).to_utc().to_rfc3339();
+        // No cwd on either side: both land in the no-project bucket, so the
+        // test never depends on the machine's real temp or home directory.
+        std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
+        std::fs::write(
+            paths.claude_dir.join("p").join("s.jsonl"),
+            format!(
+                "{}\n",
+                format_args!(r#"{{"requestId":"r1","timestamp":"{}","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":10}}}}}}"#, ts(9))
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.pi_dir.join("p")).unwrap();
+        let pi_turn = |id: &str, provider: &str, output: u64| {
+            format!(
+                r#"{{"type":"message","id":"{id}","timestamp":"{}","message":{{"role":"assistant","provider":"{provider}","model":"gpt-5.5","usage":{{"input":1,"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":0}}}}}}"#,
+                ts(10)
+            )
+        };
+        std::fs::write(
+            paths.pi_dir.join("p").join("s.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session","id":"s","cwd":""}"#,
+                pi_turn("b", "claude-bridge", 10),
+                pi_turn("c", "openai-codex", 7),
+            ),
+        )
+        .unwrap();
+
+        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None);
+        let claude = &snapshot.agents[0];
+        let pi = &snapshot.agents[3];
+        assert_eq!(claude.totals.output_tokens, 10);
+        assert_eq!(pi.agent, "pi");
+        assert_eq!(pi.totals.entries, 1);
+        assert_eq!(pi.totals.output_tokens, 7);
+        assert!(pi.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", pi.detail);
+    }
+
+    /// A home for the ledger tests: claude and pi files with no cwd (the
+    /// no-project bucket, so nothing depends on the real temp or home
+    /// directory), and a ledger in a config folder of its own.
+    struct LedgerHome {
+        dir: tempfile::TempDir,
+        paths: UsagePaths,
+    }
+
+    impl LedgerHome {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let paths = resolve_paths(Some(dir.path())).unwrap();
+            std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
+            std::fs::create_dir_all(paths.pi_dir.join("p")).unwrap();
+            Self { dir, paths }
+        }
+
+        fn ledger(&self) -> PathBuf {
+            self.dir.path().join("config").join(ledger::FILE_NAME)
+        }
+
+        /// Writes a claude transcript of `(id, day, output)` entries.
+        fn claude(&self, name: &str, entries: &[(&str, u32, u64)]) -> PathBuf {
+            let path = self.paths.claude_dir.join("p").join(name);
+            let mut content = String::new();
+            for (id, day, output) in entries {
+                content.push_str(&format!(
+                    r#"{{"requestId":"{id}","timestamp":"{}","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{output},"cache_read_input_tokens":2,"cache_creation":{{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}}}}}}}}"#,
+                    ts(*day)
+                ));
+                content.push('\n');
+            }
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        /// Writes a pi session of `(id, day, provider, output)` turns.
+        fn pi(&self, name: &str, turns: &[(&str, u32, &str, u64)]) {
+            let mut content = r#"{"type":"session","id":"s","cwd":""}"#.to_string() + "\n";
+            for (id, day, provider, output) in turns {
+                content.push_str(&format!(
+                    r#"{{"type":"message","id":"{id}","timestamp":"{}","message":{{"role":"assistant","provider":"{provider}","model":"gpt-5.5","usage":{{"input":1,"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":0}}}}}}"#,
+                    ts(*day)
+                ));
+                content.push('\n');
+            }
+            std::fs::write(self.paths.pi_dir.join("p").join(name), content).unwrap();
+        }
+
+        fn collect(&self, ledger: Option<&Path>) -> UsageSnapshot {
+            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger)
+        }
+    }
+
+    fn ledger_now() -> DateTime<Local> {
+        local(2026, 9, 15, 18, 0)
+    }
+
+    /// Noon local time on `day` of September 2026, as the UTC the stores write.
+    fn ts(day: u32) -> String {
+        local(2026, 9, day, 12, 0).to_utc().to_rfc3339()
+    }
+
+    /// A ledger file holding one no-project claude record per `(date, entries, output)`.
+    fn ledger_file(records: &[(&str, u64, u64)]) -> String {
+        let days: Vec<serde_json::Value> = records
+            .iter()
+            .map(|(date, entries, output)| {
+                serde_json::json!({
+                    "agent": "claude", "date": date, "project": "", "model": "claude-opus-5-5",
+                    "input": 0, "output": output, "cacheRead": 0, "cacheWrite5m": 0, "cacheWrite1h": 0,
+                    "reasoning": 0, "entries": entries
+                })
+            })
+            .collect();
+        serde_json::json!({ "version": 1, "days": days }).to_string()
+    }
+
+    /// Claude Code deletes old transcripts; a day the ledger saw still counts.
+    #[test]
+    fn a_deleted_claude_transcript_still_counts_through_the_ledger() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        let transcript = home.claude("s.jsonl", &[("r1", 14, 10), ("r2", 15, 20)]);
+
+        let first = home.collect(Some(&ledger));
+        assert!(ledger.exists(), "the first collect creates the ledger");
+        std::fs::remove_file(&transcript).unwrap();
+        let second = home.collect(Some(&ledger));
+
+        let (before, after) = (&first.agents[0], &second.agents[0]);
+        assert_eq!(after.status, AgentStatus::Ok);
+        assert_eq!(after.totals.entries, 2);
+        assert_eq!(after.totals.output_tokens, 30);
+        assert_eq!(after.totals, before.totals, "every counter and the cost come back from the ledger");
+        assert!(after.totals.cost.is_some());
+
+        let without_ledger = home.collect(None);
+        assert_eq!(without_ledger.agents[0].totals.entries, 0, "the agent's own files no longer have it");
+    }
+
+    /// The ledger is written only when a collect changed it: an equal
+    /// ledger, even formatted differently, keeps its bytes.
+    #[test]
+    fn an_unchanged_ledger_is_not_rewritten() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        home.collect(Some(&ledger));
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let compact = serde_json::to_string(&value).unwrap();
+        std::fs::write(&ledger, &compact).unwrap();
+        home.collect(Some(&ledger));
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), compact, "nothing changed, nothing written");
+
+        home.claude("s.jsonl", &[("r1", 14, 10), ("r2", 15, 20)]);
+        home.collect(Some(&ledger));
+        let reread = ledger::load(&ledger).unwrap();
+        assert_eq!(reread.buckets("claude").iter().count(), 2, "a new day is written");
+    }
+
+    /// A ledger Orbitbar cannot use is never overwritten: the call reads the
+    /// agents' files only and the claude and pi details say why.
+    #[test]
+    fn a_corrupt_or_unknown_version_ledger_is_left_untouched() {
+        for (content, reason) in [
+            ("{ not json".to_string(), "not a valid ledger"),
+            (ledger_file(&[("2026-09-01", 9, 900)]).replace(r#""version":1"#, r#""version":2"#), "unknown version 2"),
+        ] {
+            let home = LedgerHome::new();
+            let ledger = home.ledger();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, &content).unwrap();
+            home.claude("s.jsonl", &[("r1", 14, 10)]);
+            home.pi("s.jsonl", &[("c1", 14, "openai-codex", 7)]);
+
+            let snapshot = home.collect(Some(&ledger));
+            assert_eq!(std::fs::read_to_string(&ledger).unwrap(), content, "{reason}: left byte for byte");
+            let (claude, pi) = (&snapshot.agents[0], &snapshot.agents[3]);
+            assert_eq!(claude.totals.output_tokens, 10, "{reason}: source data only");
+            assert_eq!(pi.totals.output_tokens, 7);
+            for detail in [&claude.detail, &pi.detail] {
+                assert!(detail.contains("history ledger not used"), "{detail}");
+                assert!(detail.contains(reason), "{detail}");
+            }
+            assert!(!snapshot.agents[1].detail.contains("ledger"), "codex never uses the ledger");
+        }
+    }
+
+    /// A claude-bridge turn on a day only the ledger still has for Claude is
+    /// already counted there, whether the Claude folder is empty or gone.
+    #[test]
+    fn a_bridge_turn_on_a_day_only_the_ledger_has_for_claude_is_skipped() {
+        for claude_dir_exists in [true, false] {
+            let home = LedgerHome::new();
+            if !claude_dir_exists {
+                std::fs::remove_dir_all(&home.paths.claude_dir).unwrap();
+            }
+            let ledger = home.ledger();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, ledger_file(&[("2026-09-15", 1, 10)])).unwrap();
+            home.pi("s.jsonl", &[("b1", 15, "claude-bridge", 10), ("c1", 15, "openai-codex", 7)]);
+
+            let snapshot = home.collect(Some(&ledger));
+            let pi = &snapshot.agents[3];
+            assert_eq!(pi.totals.entries, 1, "claude folder exists: {claude_dir_exists}");
+            assert_eq!(pi.totals.output_tokens, 7);
+            assert!(pi.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", pi.detail);
+            if claude_dir_exists {
+                assert_eq!(snapshot.agents[0].totals.output_tokens, 10, "the ledger day is in Claude's totals");
+            }
+        }
+    }
+
+    /// Two collects at once, each reading a different home into the same
+    /// ledger, leave a valid file holding both.
+    #[test]
+    fn two_collects_at_once_leave_the_union_in_the_ledger() {
+        for _ in 0..5 {
+            let config = tempdir().unwrap();
+            let ledger = config.path().join(ledger::FILE_NAME);
+            let (a, b) = (LedgerHome::new(), LedgerHome::new());
+            a.claude("s.jsonl", &[("r1", 14, 10)]);
+            b.claude("s.jsonl", &[("r2", 15, 20)]);
+
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                for home in [&a, &b] {
+                    let (barrier, ledger) = (&barrier, &ledger);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        home.collect(Some(ledger));
+                    });
+                }
+            });
+
+            let stored = ledger::load(&ledger).expect("a valid ledger");
+            let days: Vec<NaiveDate> = stored.buckets("claude").iter().map(|(d, _, _)| d).collect();
+            assert_eq!(days, vec![local(2026, 9, 14, 0, 0).date_naive(), local(2026, 9, 15, 0, 0).date_naive()]);
+            let empty = LedgerHome::new();
+            assert_eq!(empty.collect(Some(&ledger)).agents[0].totals.output_tokens, 30);
+        }
+    }
+
+    /// A ledger that cannot be written never fails the collect. A directory
+    /// sits where the temp file goes, which blocks the write the same way on
+    /// every OS while the (missing) ledger itself still loads.
+    #[test]
+    fn a_ledger_that_cannot_be_saved_is_reported_in_the_detail() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        let config = ledger.parent().unwrap();
+        let blocker = config.join(format!("{}.{}.tmp", ledger::FILE_NAME, std::process::id()));
+        std::fs::create_dir_all(&blocker).unwrap();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        home.pi("s.jsonl", &[("c1", 14, "openai-codex", 7)]);
+
+        let snapshot = home.collect(Some(&ledger));
+        let (claude, pi) = (&snapshot.agents[0], &snapshot.agents[3]);
+        assert_eq!(claude.totals.output_tokens, 10);
+        assert!(claude.detail.contains("history ledger not saved"), "{}", claude.detail);
+        assert!(pi.detail.contains("history ledger not saved"), "{}", pi.detail);
+        assert!(!ledger.exists(), "no ledger written");
+        assert!(blocker.is_dir(), "the blocking directory is left alone");
+    }
+
+    /// Records older than the 365 days that end today leave the file.
+    #[test]
+    fn a_collect_prunes_records_older_than_365_days() {
+        let home = LedgerHome::new();
+        let ledger = home.ledger();
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let today = ledger_now().date_naive();
+        let kept = (today - Duration::days(364)).to_string();
+        let old = (today - Duration::days(365)).to_string();
+        std::fs::write(&ledger, ledger_file(&[(&kept, 1, 1), (&old, 1, 2)])).unwrap();
+
+        home.collect(Some(&ledger));
+        let days: Vec<String> =
+            ledger::load(&ledger).unwrap().buckets("claude").iter().map(|(d, _, _)| d.to_string()).collect();
+        assert_eq!(days, vec![kept]);
+    }
+
+    /// Without a ledger path the collect only reads: the parity harness
+    /// relies on it.
+    #[test]
+    fn a_collect_without_a_ledger_path_writes_nothing() {
+        let home = LedgerHome::new();
+        home.claude("s.jsonl", &[("r1", 14, 10)]);
+        let before = list_files(home.dir.path());
+        home.collect(None);
+        assert_eq!(list_files(home.dir.path()), before);
+    }
+
+    fn list_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                }
+                out.push(entry.path());
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
@@ -626,7 +1083,7 @@ mod tests {
 
         let mut cache = ProjectRootCache::with_policy(RootPolicy::default());
         let root = resolve_project_root(&nested.to_string_lossy(), &mut cache);
-        assert_eq!(root, Some(normalize_project_path(&dir.path().to_string_lossy())));
+        assert_eq!(root, canonical_key(dir.path()));
     }
 
     #[test]
@@ -646,7 +1103,7 @@ mod tests {
 
         let mut cache = ProjectRootCache::with_policy(RootPolicy::default());
         let root = resolve_project_root(&worktree.to_string_lossy(), &mut cache);
-        assert_eq!(root, Some(normalize_project_path(&main.to_string_lossy())));
+        assert_eq!(root, canonical_key(&main));
     }
 
     /// A resolver whose walk stops at `home` and that treats `temp` as scratch,
@@ -662,8 +1119,105 @@ mod tests {
         resolve_project_root(&cwd.to_string_lossy(), &mut ProjectRootCache::with_policy(policy))
     }
 
-    fn key(path: &Path) -> Option<String> {
-        Some(normalize_project_path(&path.to_string_lossy()))
+    /// The key of an existing folder: its path as the file system resolves it
+    /// (macOS reports the temp dir as `/var` for `/private/var`; Windows may
+    /// report an 8.3 short name).
+    /// The key of a deleted folder `missing` directly under the surviving
+    /// `parent`: the parent in resolved form (the OS temp dir is a short
+    /// `RUNNER~1` name on Windows CI and `/var` for `/private/var` on macOS)
+    /// plus the missing name.
+    fn resolved_key(parent: &Path, missing: &str) -> Option<String> {
+        let resolved = std::fs::canonicalize(parent).unwrap();
+        let parent = PathBuf::from(strip_verbatim_prefix(&resolved.to_string_lossy()));
+        Some(normalize_project_path(&parent.join(missing).to_string_lossy()))
+    }
+
+    fn canonical_key(path: &Path) -> Option<String> {
+        let resolved = std::fs::canonicalize(path).unwrap();
+        Some(normalize_project_path(&strip_verbatim_prefix(&resolved.to_string_lossy())))
+    }
+
+    /// Links `link` to the existing directory `target`: a junction on Windows,
+    /// a symlink elsewhere. `false` when the OS refused to create it.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success())
+                && link.exists()
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// `C:\repositories` is a junction to `R:\repositories`: a repository
+    /// reached through both paths is one project key, the resolved one.
+    #[test]
+    fn two_paths_to_the_same_repository_through_a_junction_share_one_key() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        let repo = real.join("orbitbar");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let link = dir.path().join("link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+        let p = || policy(dir.path(), &[]);
+
+        let direct = resolve(&repo.join("app"), p());
+        let through_link = resolve(&link.join("orbitbar").join("app"), p());
+        let link_root = resolve(&link.join("orbitbar"), p());
+        assert_eq!(direct, canonical_key(&repo));
+        assert_eq!(through_link, direct);
+        assert_eq!(link_root, direct);
+    }
+
+    /// A repository reached through a link keeps its key after it is deleted,
+    /// so the ledger's stored days and the transcripts' days stay one project
+    /// instead of two rows counting the same usage.
+    #[test]
+    fn a_deleted_repository_reached_through_a_link_keeps_its_resolved_key() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        let repo = real.join("proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let link = dir.path().join("link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+        let cwd = link.join("proj").join("app");
+        let before = resolve(&cwd, policy(dir.path(), &[]));
+        assert_eq!(before, canonical_key(&repo));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert_eq!(resolve(&cwd, policy(dir.path(), &[])), before);
+    }
+
+    /// A folder outside any repository stays excluded when it is reached
+    /// through a link: the home boundary is compared in resolved form too.
+    #[test]
+    fn a_linked_folder_outside_any_repository_is_still_excluded() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let real = dir.path().join("plain");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("plain-link");
+        if !link_dir(&real, &link) {
+            eprintln!("skipped: could not create a directory link in {}", dir.path().display());
+            return;
+        }
+
+        assert_eq!(resolve(&link, policy(dir.path(), &[])), None);
     }
 
     /// An existing folder with no repository above it (up to the home
@@ -703,7 +1257,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let deleted = dir.path().join(".claude").join("worktrees").join("agent-gone");
 
-        assert_eq!(resolve(&deleted, RootPolicy::default()), key(dir.path()));
+        assert_eq!(resolve(&deleted, RootPolicy::default()), canonical_key(dir.path()));
     }
 
     /// A deleted folder with no repo above it is keyed by its own path.
@@ -712,7 +1266,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let deleted = dir.path().join("gone-project");
 
-        assert_eq!(resolve(&deleted, policy(dir.path(), &[])), key(&deleted));
+        assert_eq!(resolve(&deleted, policy(dir.path(), &[])), resolved_key(dir.path(), "gone-project"));
     }
 
     /// A repo that was renamed or deleted leaves session cwds in its
@@ -731,7 +1285,7 @@ mod tests {
             gone.join(".claude").join("worktrees").join("agent-x"),
             gone.join("hotbar-tauri").join("src-tauri"),
         ] {
-            assert_eq!(resolve(&sub, p()), key(&gone), "{}", sub.display());
+            assert_eq!(resolve(&sub, p()), resolved_key(dir.path(), "herdr-omniroute"), "{}", sub.display());
         }
     }
 
@@ -759,10 +1313,7 @@ mod tests {
         let temp = dir.path().join("Temp");
         let sibling = dir.path().join("Temp-projects").join("app");
 
-        assert_eq!(
-            resolve(&sibling, policy(dir.path(), &[&temp])),
-            key(&dir.path().join("Temp-projects"))
-        );
+        assert_eq!(resolve(&sibling, policy(dir.path(), &[&temp])), resolved_key(dir.path(), "Temp-projects"));
     }
 
     /// Windows paths are case-insensitive: the agent may record the temp dir
@@ -808,8 +1359,9 @@ mod tests {
 
     /// Not a unit test: prints the real home directory's ThisMonth snapshot
     /// so it can be sanity-checked by hand against what the agents' own UIs
-    /// report. `--ignored` because it depends on this machine's real
-    /// `.claude` / `.codex` / opencode stores, which do not exist in CI or on
+    /// report. It passes no ledger path, so it never writes a file.
+    /// `--ignored` because it depends on this machine's real
+    /// `.claude` / `.codex` / opencode / `.pi` stores, which do not exist in CI or on
     /// a fresh checkout.
     ///
     /// Run with: `cargo test -- --ignored parity --nocapture`
@@ -818,7 +1370,7 @@ mod tests {
     fn parity_this_month_against_the_real_home() {
         let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
         let overrides = pricing::PriceOverrides::default();
-        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides);
+        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None);
 
         println!("\n=== orbitbar Rust reader parity (ThisMonth) ===");
         for agent in &snapshot.agents {
@@ -831,6 +1383,7 @@ mod tests {
                 agent.totals.cost,
                 agent.projects.len()
             );
+            println!("          detail: {}", agent.detail);
         }
     }
 }

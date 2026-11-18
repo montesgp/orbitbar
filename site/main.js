@@ -9,29 +9,67 @@ const $ = (id) => document.getElementById(id);
 (() => {
   const REPO = 'montesgp/orbitbar';
   const LATEST = `https://github.com/${REPO}/releases/latest`;
+  // Each system lists its builds, the default first. A build for another architecture is offered
+  // only when the release has its installer.
   const SYSTEMS = {
     windows: {
       name: 'Windows',
-      detail: 'Windows 10 and 11 · installer',
-      installer: /_x64-setup\.exe$/,
-      formats: [{ label: '.msi', pattern: /_x64_[\w-]+\.msi$/ }],
+      builds: [
+        {
+          arch: 'x64',
+          detail: 'Windows 10 and 11 · installer',
+          label: 'installer (.exe)',
+          installer: /_x64-setup\.exe$/,
+          formats: [{ label: '.msi', pattern: /_x64_[\w-]+\.msi$/ }],
+        },
+        {
+          arch: 'arm64',
+          detail: 'Windows 11 on Arm · installer',
+          label: 'installer (.exe)',
+          installer: /_arm64-setup\.exe$/,
+          formats: [{ label: '.msi', pattern: /_arm64_[\w-]+\.msi$/ }],
+        },
+      ],
     },
     macos: {
       name: 'macOS',
-      detail: 'Apple silicon and Intel · .dmg',
-      installer: /_universal\.dmg$/,
-      formats: [],
+      builds: [
+        {
+          arch: 'universal',
+          detail: 'Apple silicon and Intel · .dmg',
+          label: '.dmg',
+          installer: /_universal\.dmg$/,
+          formats: [],
+        },
+      ],
     },
     linux: {
       name: 'Linux',
-      detail: 'x64 · AppImage',
-      installer: /_amd64\.AppImage$/,
-      formats: [
-        { label: '.deb (Debian, Ubuntu)', pattern: /_amd64\.deb$/ },
-        { label: '.rpm (Fedora, openSUSE)', pattern: /\.x86_64\.rpm$/ },
+      builds: [
+        {
+          arch: 'x64',
+          detail: 'x64 · AppImage',
+          label: 'AppImage',
+          installer: /_amd64\.AppImage$/,
+          formats: [
+            { label: '.deb (Debian, Ubuntu)', pattern: /_amd64\.deb$/ },
+            { label: '.rpm (Fedora, openSUSE)', pattern: /\.x86_64\.rpm$/ },
+          ],
+        },
+        {
+          arch: 'arm64',
+          detail: 'ARM64 · AppImage',
+          label: 'AppImage',
+          installer: /_aarch64\.AppImage$/,
+          formats: [
+            { label: '.deb (Debian, Ubuntu)', pattern: /_arm64\.deb$/ },
+            { label: '.rpm (Fedora, openSUSE)', pattern: /\.aarch64\.rpm$/ },
+          ],
+        },
       ],
     },
   };
+  const ARCH_NAMES = { x64: 'x64', arm64: 'ARM64' };
   const KEYS = Object.keys(SYSTEMS);
   let assets = [];
 
@@ -52,10 +90,44 @@ const $ = (id) => document.getElementById(id);
     return null;
   }
 
+  /**
+   * `arm64`, `x64`, or null when unknown. Client hints (Chrome, Edge) report the architecture even
+   * where the user agent string is frozen to x64; Firefox on Linux names it in the user agent.
+   * Firefox and Safari on Windows give no hint, so those visitors keep the x64 default.
+   */
+  async function detectArch() {
+    const hints = navigator.userAgentData;
+    if (hints && typeof hints.getHighEntropyValues === 'function') {
+      try {
+        const { architecture, bitness } = await hints.getHighEntropyValues(['architecture', 'bitness']);
+        // 32-bit ARM (older Raspberry Pi systems) cannot run the ARM64 build.
+        if (architecture === 'arm') return bitness === '32' ? null : 'arm64';
+        if (architecture === 'x86') return 'x64';
+      } catch {
+        // Hints refused: fall back to the user agent string.
+      }
+    }
+    return /aarch64|arm64/.test((navigator.userAgent || '').toLowerCase()) ? 'arm64' : null;
+  }
+
   /** The download URL of the first asset whose name matches, or the latest release page. */
   function urlFor(pattern) {
     const asset = assets.find((a) => pattern.test(a.name));
     return asset ? asset.url : LATEST;
+  }
+
+  const released = (pattern) => assets.some((a) => pattern.test(a.name));
+
+  /** The build for the visitor's architecture when the release has it, else the default build. */
+  function pickBuild(system, arch) {
+    return system.builds.find((b) => b.arch === arch && released(b.installer)) || system.builds[0];
+  }
+
+  /** Links to a formats list, keeping only the files the release has. */
+  function formatLinks(formats) {
+    return formats
+      .filter((f) => released(f.pattern))
+      .flatMap((f, i) => [...(i ? [' · '] : []), link(urlFor(f.pattern), f.label)]);
   }
 
   function link(href, text) {
@@ -65,27 +137,38 @@ const $ = (id) => document.getElementById(id);
     return a;
   }
 
-  function render(key) {
+  function render(key, arch) {
     const system = SYSTEMS[key];
+    const build = system ? pickBuild(system, arch) : null;
     const button = $('download');
-    if (system) {
-      button.href = urlFor(system.installer);
+    if (build) {
+      button.href = urlFor(build.installer);
       $('download-os').textContent = `for ${system.name}`;
-      $('download-detail').textContent = system.detail;
+      $('download-detail').textContent = build.detail;
     }
 
-    // Other formats of the same system, once the release says which files exist.
-    const formats = system ? system.formats.filter((f) => assets.some((a) => f.pattern.test(a.name))) : [];
-    const formatLinks = formats.flatMap((f, i) => [...(i ? [' · '] : []), link(urlFor(f.pattern), f.label)]);
-    $('formats-links').replaceChildren(...formatLinks);
+    // Other formats of the same build, once the release says which files exist.
+    const formats = build ? formatLinks(build.formats) : [];
+    $('formats-links').replaceChildren(...formats);
     $('formats').hidden = formats.length === 0;
+
+    // The same system for the other architecture: ARM64 when the visitor's is unknown or x64, so
+    // nobody is left without a download, and x64 for visitors given the ARM64 build.
+    const other = system ? system.builds.find((b) => b !== build && released(b.installer)) : null;
+    if (other) {
+      $('arch-name').textContent = ARCH_NAMES[other.arch];
+      const installer = link(urlFor(other.installer), other.label);
+      const rest = formatLinks(other.formats);
+      $('arch-links').replaceChildren(installer, ...(rest.length ? [' · ', ...rest] : []));
+    }
+    $('arch').hidden = !other;
 
     // The other systems, or all three when the visitor's is unknown.
     const others = KEYS.filter((k) => k !== key);
     KEYS.forEach((k) => {
       const anchor = $(`link-${k}`);
       anchor.hidden = k === key;
-      anchor.href = urlFor(SYSTEMS[k].installer);
+      anchor.href = urlFor(SYSTEMS[k].builds[0].installer);
       // A separator follows every shown link except the last one.
       const separator = $(`sep-${k}`);
       if (separator) separator.hidden = k === key || k === others[others.length - 1];
@@ -98,7 +181,7 @@ const $ = (id) => document.getElementById(id);
     KEYS.forEach((k) => { $(`help-${k}`).open = k === key; });
   }
 
-  async function loadLatestRelease(key) {
+  async function loadLatestRelease(key, archPromise) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
@@ -117,7 +200,7 @@ const $ = (id) => document.getElementById(id);
       assets = (Array.isArray(release.assets) ? release.assets : [])
         .map((a) => ({ name: String(a && a.name), url: String(a && a.browser_download_url) }))
         .filter((a) => a.url === prefix + encodeURIComponent(a.name) || a.url === prefix + a.name);
-      render(key);
+      render(key, await archPromise);
 
       $('release-tag').textContent = tag;
       $('release-link').href = url;
@@ -137,9 +220,10 @@ const $ = (id) => document.getElementById(id);
   const detected = detectSystem();
   const key = SYSTEMS[detected] ? detected : null;
   $('desktop-only').hidden = detected !== 'mobile';
-  render(key);
+  render(key, null);
   showHelp(key || 'windows');
-  loadLatestRelease(key);
+  // Asked in parallel with the release; detectArch never rejects.
+  loadLatestRelease(key, detectArch());
 })();
 
 // ---- animated preview ----------------------------------------------------------------------

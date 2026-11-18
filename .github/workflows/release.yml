@@ -68,12 +68,28 @@ jobs:
           - name: Windows
             platform: windows-latest
             args: ''
+            rust-targets: ''
+          # Cross-compiled on the x64 runner, as the Tauri docs describe. The
+          # NSIS installer itself stays x86 and runs under emulation on ARM.
+          - name: Windows ARM64
+            platform: windows-latest
+            args: '--target aarch64-pc-windows-msvc'
+            rust-targets: 'aarch64-pc-windows-msvc'
           - name: macOS (universal)
             platform: macos-latest
             args: '--target universal-apple-darwin'
+            # Both Apple targets are needed for the universal binary.
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
           - name: Linux
             platform: ubuntu-22.04
             args: ''
+            rust-targets: ''
+          # Native ARM runner (free for public repositories): the AppImage
+          # tooling cannot cross-compile.
+          - name: Linux ARM64
+            platform: ubuntu-22.04-arm
+            args: ''
+            rust-targets: ''
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -88,13 +104,14 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Both Apple targets are needed for the universal binary.
-          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust-targets }}
 
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri -> target
+          # The two Windows builds share a runner and a host toolchain.
+          key: ${{ matrix.name }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -107,16 +124,25 @@ jobs:
         working-directory: app
         run: npm ci
 
-      # Installers are unsigned: no signing or updater secrets are configured.
+      # The OS installers are still not code-signed (no Windows or Apple
+      # certificate). The update artifacts are signed with the updater key
+      # (`bundle.createUpdaterArtifacts` in tauri.conf.json): each platform
+      # uploads its update bundle, the matching .sig and its entry in
+      # latest.json, which installed copies check (`plugins.updater`). Windows
+      # updates use the NSIS setup.exe, the installer the download page offers.
       # The release is the draft from create-release, addressed by id.
       - name: Build and upload installers
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: app
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
 
   publish-release:
     name: Publish release
@@ -124,6 +150,50 @@ jobs:
     needs: [create-release, build]
     runs-on: ubuntu-22.04
     steps:
+      # The build jobs run in parallel and each merges its own entry into the
+      # release's latest.json, so two jobs finishing together can drop one.
+      # A platform missing there would never receive updates: the release
+      # stays a draft instead, and re-running that platform's build job adds
+      # the entry back (and re-runs this check).
+      - name: Check that latest.json lists every platform
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            const expected = [
+              'windows-x86_64', 'windows-aarch64',
+              'darwin-x86_64', 'darwin-aarch64',
+              'linux-x86_64', 'linux-aarch64',
+            ];
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+            });
+            const asset = assets.find((a) => a.name === 'latest.json');
+            if (!asset) {
+              core.setFailed('The release has no latest.json: installs would not find this update.');
+              return;
+            }
+            const { data } = await github.rest.repos.getReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              asset_id: asset.id,
+              headers: { accept: 'application/octet-stream' },
+            });
+            // Octokit may hand back an ArrayBuffer, a string or parsed JSON,
+            // depending on the content type GitHub serves the asset with.
+            const manifest = typeof data === 'string' ? JSON.parse(data)
+              : data instanceof ArrayBuffer ? JSON.parse(Buffer.from(data).toString('utf8'))
+              : data;
+            const platforms = Object.keys(manifest.platforms ?? {});
+            const missing = expected.filter((p) => !platforms.includes(p));
+            core.info(`latest.json ${manifest.version}: ${platforms.join(', ')}`);
+            if (missing.length > 0) {
+              core.setFailed(`latest.json is missing ${missing.join(', ')}. The builds succeeded but raced on the file: re-run the build job of each missing platform, which also re-runs this check.`);
+            }
+
       - name: Publish the draft release
         uses: actions/github-script@v7
         env:

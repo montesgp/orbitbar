@@ -4,7 +4,7 @@
 
 Orbitbar is a Tauri 2 desktop app: a Rust core plus a TypeScript/HTML
 frontend, packaged as one native binary per OS (Windows, macOS, Linux). It
-reads the token-usage history that Claude Code, Codex and OpenCode write to
+reads the token-usage history that Claude Code, Codex, OpenCode and Pi write to
 disk, prices it, and renders it in a small always-on-top bar, overall and per
 project. Installation and usage are covered in the [root README](../README.md).
 
@@ -22,37 +22,52 @@ flowchart LR
     direction TB
     CMD["Tauri commands<br/>get_config · save_config · get_usage<br/>get_config_path · ensure_pricing_file · quit_app"]
     CFG["config.rs<br/>schema, load/save, themes"]
+    UPD["lib.rs update checks<br/>tauri-plugin-updater"]
     USAGE["usage/mod.rs<br/>collect_usage, TimeWindow"]
     PRICE["usage/pricing.rs<br/>built-in table + pricing.json"]
+    LEDGER["usage/ledger.rs<br/>usage-ledger.json, claude + pi daily buckets"]
     CMD --> CFG
+    UPD -->|"autoUpdate, each tick"| CFG
     CMD --> USAGE
     USAGE --> PRICE
+    USAGE -->|"read + write (own file)"| LEDGER
   end
   subgraph READERS["Per-agent readers — app/src-tauri/src/usage"]
     direction TB
     RC["claude.rs"]
     RX["codex.rs"]
     RO["opencode.rs"]
+    RP["pi.rs"]
   end
   subgraph SRC["Local files the agents wrote"]
     direction TB
     CC["~/.claude/projects/**/*.jsonl"]
     CX["~/.codex/sessions/**/*.jsonl"]
     OP["~/.local/share/opencode/opencode.db"]
+    PI["~/.pi/agent/sessions/**/*.jsonl"]
   end
 
   MAIN -->|"invoke()"| CMD
   USAGE --> RC
   USAGE --> RX
   USAGE --> RO
+  USAGE --> RP
+  RP -.->|"claude-bridge check"| RC
   RC -->|"read-only"| CC
   RX -->|"read-only"| CX
   RO -->|"read-only SQLite"| OP
+  RP -->|"read-only"| PI
   CMD -->|"JSON payload"| MAIN
+  GH[("GitHub Releases<br/>latest.json + signed bundles")]
+  UPD -->|"HTTPS, every 6 h"| GH
 ```
 
-Every read is a local file, and the frontend talks to the Rust core only
-through Tauri's `invoke()` IPC.
+Every usage read is a local file, and the frontend talks to the Rust core
+only through Tauri's `invoke()` IPC. The one network call is the update
+check against this repository's GitHub Releases (see the cross-platform
+notes), which `autoUpdate` turns off. The agents' files are only read; the one
+file the usage code writes is Orbitbar's own `usage-ledger.json` in its
+config directory.
 
 ## Layers
 
@@ -60,13 +75,15 @@ through Tauri's `invoke()` IPC.
 | --- | --- | --- |
 | Window/UI | `app/src/main.ts`, `app/src/styles.css`, `app/index.html` | Crescent bar geometry, collapse/expand, drag, theme application, item clicks, panel and context-menu toggling |
 | View-model | `app/src/usage-view.ts` | Pure functions that turn a `UsageSnapshot` into rendered lines — no DOM, unit-testable in isolation |
-| Tauri commands | `app/src-tauri/src/lib.rs` | `get_config`, `save_config`, `get_usage`, `get_config_path`, `ensure_pricing_file`, `run_command`, `run_panel_command`, `quit_app`, `place_window`, `plan_window`; window placement and autostart reconciliation on launch |
+| Tauri commands | `app/src-tauri/src/lib.rs` | `get_config`, `save_config`, `get_usage`, `get_config_path`, `ensure_pricing_file`, `run_command`, `run_panel_command`, `quit_app`, `place_window`, `plan_window`; window placement and autostart reconciliation on launch; the background update checks (`update_check_due` decides each tick) |
 | Panel commands | `app/src-tauri/src/panel.rs`, `app/src-tauri/src/launch.rs` | `panel:<program> [args]` items: `launch.rs` parses and resolves the command exactly like `run:`; `panel.rs` runs it with no console window, closed stdin, a 10 s timeout and a 64 KiB cap, strips terminal escapes and returns text, stderr, exit code and a timeout flag. The frontend shows it as preformatted text (`panel-output-view.ts`) |
 | Placement | `app/src-tauri/src/placement.rs` | Pure window-placement rules: grow toward the side with room, clamp into the work area, collapse anchoring, restoring a saved position |
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
-| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
-| Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the other two |
+| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
+| Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
+| Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket on its own |
+| Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
 ## Interaction model
@@ -107,28 +124,56 @@ through Tauri's `invoke()` IPC.
 ## Data flow: opening the usage panel
 
 1. The frontend calls `invoke("get_usage", { window })` for the selected
-   `TimeWindow` (`today` / `last7Days` / `last30Days` / `thisMonth`),
+   `TimeWindow` (`today` / `last7Days` / `last30Days` / `thisMonth` /
+   `last365Days`, today plus the previous 364 days),
    starting with `today`.
-2. `get_usage` (in `lib.rs`) resolves the three store paths under the
-   user's home directory, loads `pricing.json` if present, and runs the
+2. `get_usage` (in `lib.rs`) resolves the four store paths under the
+   user's home directory, loads `pricing.json` if present, passes the path
+   of `usage-ledger.json` in the same config directory, and runs the
    whole read off the main thread (`spawn_blocking`) so a large history
    never stalls the window.
-3. `usage::collect_usage` calls each reader — `claude::read_usage`,
-   `codex::read_usage`, `opencode::read_usage` — independently. Each
+3. `usage::collect_usage` calls each reader, in the order the snapshot
+   lists them — `claude::read_daily` plus `claude::report`,
+   `codex::read_usage`, `opencode::read_usage`, `pi::read_usage`. Each
    returns an `AgentUsageReport` with its own `AgentStatus`
    (`Ok` / `NotInstalled` / `Error`), so one broken agent store never hides
-   the other two.
-4. Claude and Codex totals are priced through `pricing::estimate_cost`
+   the others. Pi is the one reader that takes another's data: its
+   `claude-bridge` turns are Claude Code sessions, also in Claude's
+   transcripts with no shared id, so `pi::read_daily` counts one only for a
+   `(date, project)` that Claude's daily buckets lack, and the report's
+   `detail` says how many it left out. Every other Pi provider always
+   counts.
+4. Claude, Codex and Pi totals are priced through `pricing::estimate_cost`
    against the built-in table plus any `pricing.json` overrides; OpenCode
    already carries its own reported cost and skips pricing entirely.
-5. The `UsageSnapshot` — window bounds, per-agent totals, per-project
+   Claude and Pi entries carry their own timestamps, so their `read_daily`
+   sorts them into `(local date, project key)` buckets of raw counters plus
+   the bucket's last model (`usage::daily`), and their `report` folds the
+   window's dates: each bucket is priced with its own model and the amounts
+   summed, so a total's cost is missing only when no bucket in it has a
+   price.
+5. Before folding, the claude and pi buckets are merged with the ledger
+   (`usage::ledger::Session`, which holds a process-wide lock from the load
+   to the write). Per `(agent, date, project)` the bucket with more entries
+   wins, the agent's files on a tie, and a day only the ledger has still
+   counts, so a transcript Claude Code deleted after `cleanupPeriodDays`
+   stays in the history. Claude is merged first and its merged buckets go
+   to pi, so the `claude-bridge` check also sees the days only the ledger
+   has. Records older than 365 days are pruned, and the file is written
+   (temp file plus rename) only when this call changed it. The ledger holds
+   raw counters and the model, never a cost. A file that cannot be read,
+   does not parse or has an unknown version is left untouched: that call
+   uses the agents' files only and the claude and pi `detail` say why; a
+   failed write is reported the same way and never fails `get_usage`.
+   Codex and OpenCode are not stored: their stores keep their history.
+6. The `UsageSnapshot` — window bounds, per-agent totals, per-project
    breakdown, an optional `pricingWarning` — serializes back to the
    frontend, where `usage-view.ts` turns it into the rendered panel.
 
 ## Adding a new agent reader
 
 Each reader is self-contained and returns the same shape, so adding one
-does not touch the other two:
+does not touch the others:
 
 1. Add `app/src-tauri/src/usage/<agent>.rs` with a
    `pub fn read_usage(root: &Path, start: DateTime<Local>, end: DateTime<Local>, ...) -> AgentUsageReport`,
@@ -138,7 +183,10 @@ does not touch the other two:
    resolution rule in `resolve_paths`, and a call inside `collect_usage`.
 3. If the new agent reports cost per session already, skip pricing for it
    the way `opencode.rs` does; if it only reports tokens, price it through
-   `pricing::estimate_cost` the way `claude.rs`/`codex.rs` do.
+   `pricing::estimate_cost` the way `claude.rs`/`codex.rs`/`pi.rs` do. A
+   store whose entries carry their own timestamps can fill
+   `usage::daily::DailyBuckets` and fold them, the way `claude.rs` and
+   `pi.rs` do.
 4. Add the agent to `app/src/usage-view.ts`'s types and rendering, and a
    default item (`agent-usage:<agent>`) in `config.rs::default_items` if it
    should get its own cell.
@@ -162,7 +210,14 @@ beyond wiring the new item's `action` to the new `invoke()` call.
   SQLite is compiled into the binary and needs no system library on any OS.
 - The window is transparent, frameless and always-on-top through Tauri's
   own window flags (`tauri.conf.json`), which map to the native APIs of
-  each OS without extra code here.
+  each OS without extra code here. On macOS transparency also needs
+  `app.macOSPrivateApi` in `tauri.conf.json` and Tauri's `macos-private-api`
+  feature in `Cargo.toml`; without them the bar sits on a white box.
+- The bar (72x400), the collapsed tab (46x46) and the panel and menu widths
+  are CSS pixels. Placement works in physical pixels, so every size is scaled
+  with the monitor's scale factor first (`cssToPhysical` in
+  `placement-view.ts`, `placement::physical_size` in Rust): on a scale-2
+  Retina screen the bar's window is 144x800.
 - Autostart uses `tauri-plugin-autostart`, which registers the native
   mechanism per platform: a Registry Run entry on Windows, a LaunchAgent on
   macOS and an XDG autostart `.desktop` entry on Linux. `config.json`'s
@@ -171,8 +226,23 @@ beyond wiring the new item's `action` to the new `invoke()` call.
   system" entry and the `toggle-autostart` cell share one frontend toggle
   that flips the OS entry (direction taken from the real registration) and
   then persists `autoStart`.
+- Updates use `tauri-plugin-updater`, driven from Rust only (no frontend
+  permission). A thread started in `setup` checks about 30 s after launch and
+  then every 6 hours. Each tick re-reads `config.json`; `update_check_due`
+  skips it in a debug build, when `autoUpdate` is false, and on Linux unless
+  the app runs as an AppImage (`APPIMAGE` set; a `.deb` or `.rpm` belongs to
+  the package manager). A due tick fetches `latest.json` from
+  `plugins.updater.endpoints` in `tauri.conf.json`; when it names a newer
+  version the plugin downloads the bundle, verifies its minisign signature
+  against `plugins.updater.pubkey`, installs it and Orbitbar restarts. On
+  Windows the NSIS installer runs in passive mode and restarts the app itself.
+  Every failure is logged and the next tick tries again. The Release workflow
+  signs the bundles with the private key from the repository secrets and
+  uploads `latest.json`.
 - The webview is WebView2 on Windows, WKWebView on macOS and WebKitGTK 4.1 on
   Linux.
+- `usage-ledger.json` lives next to `config.json` (see the data flow above);
+  `std::fs::rename` replaces the old file in one step on every OS.
 - `pricing.json` lives next to `config.json` and is reloaded on every
   `get_usage` call. The "Open pricing file" menu entry creates it from a
   template if it is missing and opens it with the opener plugin, which the
@@ -185,12 +255,15 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src/main.ts` | Window sizing/positioning, theme application, config load/save, item click handling |
 | `app/src/usage-view.ts` | Usage panel view-model: formatting, window options, per-agent/per-project rendering |
 | `app/src/styles.css` | Bar and panel styling, driven by `--ob-*` custom properties |
-| `app/src-tauri/src/lib.rs` | Tauri commands, applying window placement, autostart reconciliation, single-instance guard |
+| `app/src-tauri/src/lib.rs` | Tauri commands, applying window placement, autostart reconciliation, single-instance guard, update checks |
 | `app/src-tauri/src/placement.rs` | Pure placement rules (unit tested) |
 | `app/src-tauri/src/config.rs` | Config schema, load/save, theme palettes |
 | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, `UsageSnapshot`, project-path normalization |
+| `app/src-tauri/src/usage/daily.rs` | Daily buckets and the window fold |
 | `app/src-tauri/src/usage/claude.rs` | Claude Code JSONL reader |
 | `app/src-tauri/src/usage/codex.rs` | Codex CLI JSONL reader |
 | `app/src-tauri/src/usage/opencode.rs` | OpenCode SQLite reader |
+| `app/src-tauri/src/usage/pi.rs` | Pi JSONL reader, with the `claude-bridge` check against Claude's buckets |
+| `app/src-tauri/src/usage/ledger.rs` | Orbitbar's own usage ledger: load, merge, prune, atomic write |
 | `app/src-tauri/src/usage/pricing.rs` | Built-in price table, `pricing.json` override loading, cost estimation |
 | `extensions/` | Optional Herdr and OmniRoute integrations, see [extensions/README.md](../extensions/README.md) |

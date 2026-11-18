@@ -44,6 +44,12 @@ npm run tauri dev     # dev loop (Vite and reload)
 npm run tauri build   # installers and bundles for the current OS
 ```
 
+Bundles include signed update artifacts, so `npm run tauri build` needs the
+updater key (`TAURI_SIGNING_PRIVATE_KEY`); without it, build with
+`--config '{"bundle":{"createUpdaterArtifacts":false}}'` or use
+`npx tauri build --no-bundle`. See
+[CONTRIBUTING.md](../CONTRIBUTING.md#updater-signing-key).
+
 A debug build never registers the OS autostart entry, so development runs do
 not leave anything behind at login.
 
@@ -89,7 +95,8 @@ to install beyond the OS webview: Windows NSIS `-setup.exe` and `.msi`, macOS
 Linux bundles are built by CI. CI (`.github/workflows/ci.yml`) checks every
 pull request on all three OSes, and pushing a `vX.Y.Z` tag runs the Release
 workflow (`.github/workflows/release.yml`), which publishes unsigned
-installers to GitHub Releases. See the release process in
+installers to GitHub Releases, plus the signed update artifacts and the
+`latest.json` the app's updater reads. See the release process in
 [CONTRIBUTING.md](../CONTRIBUTING.md#release-process).
 
 Always build releases through the Tauri CLI (`npm run tauri build`, or

@@ -334,6 +334,24 @@ body.moon .bar {
   white-space: nowrap;
 }
 
+/* Expands an agent's list past the top 5, or collapses it back. */
+.usage-projects-toggle {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--ob-hover-fg);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.usage-projects-toggle:focus-visible {
+  outline: 1px solid var(--ob-hover-fg);
+  outline-offset: 2px;
+}
+
 /*
  * Right-click context menu — a card styled with the same --ob-* tokens as
  * .panel, positioned by main.ts (openContextMenu/positionContextMenu) inside
