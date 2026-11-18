@@ -18,16 +18,24 @@
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
+    cache::FileCache, find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
     ProjectRootCache, UsageTotals,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 pub const AGENT: &str = "claude";
+
+/// One session file's entries before project-root resolution: summed per
+/// `(local date, normalized raw cwd, model)`, which is what
+/// `usage::cache` keeps per file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileUsage {
+    entries: BTreeMap<(NaiveDate, String, String), DailyCounters>,
+}
 
 /// Everything one scan of the store found, before any window is applied.
 #[derive(Debug, Clone, Default)]
@@ -49,7 +57,7 @@ pub fn read_usage(
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
-    match read_daily(root, root_cache) {
+    match read_daily(root, &FileCache::default(), root_cache) {
         Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides, &ProjectAliases::default()),
         Err(report) => *report,
     }
@@ -58,9 +66,14 @@ pub fn read_usage(
 /// Scans every session file under `root` into daily buckets. Per-project
 /// buckets are keyed by resolved project root (see `resolve_project_root`),
 /// not the raw session cwd, so two cwds inside the same repository share a
-/// bucket. `Err` carries the finished report when there is nothing to fold:
-/// the store is missing, or no session file could be read.
-pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<ClaudeDaily, Box<AgentUsageReport>> {
+/// bucket. Only files that changed since the last call are read again (see
+/// `usage::cache`). `Err` carries the finished report when there is nothing
+/// to fold: the store is missing, or no session file could be read.
+pub fn read_daily(
+    root: &Path,
+    cache: &FileCache<FileUsage>,
+    root_cache: &mut ProjectRootCache,
+) -> Result<ClaudeDaily, Box<AgentUsageReport>> {
     if !root.exists() {
         return Err(Box::new(AgentUsageReport::not_installed(
             AGENT,
@@ -69,80 +82,11 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
     }
 
     let files = find_jsonl_files(root);
-    let mut daily = ClaudeDaily::default();
-
-    for file in &files {
-        let Ok(handle) = std::fs::File::open(file) else { continue };
-        daily.files_scanned += 1;
-        let reader = BufReader::new(handle);
-
-        // Dedupe is per file: the same requestId can appear in more than one
-        // session file (a resumed session, a subagent transcript), and those
-        // are separate billable events.
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            if !line.contains("\"usage\"") {
-                continue;
-            }
-            // A malformed line is skipped, never fatal to the file.
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-
-            let usage = entry
-                .get("message")
-                .and_then(|m| m.get("usage"))
-                .or_else(|| entry.get("usage"));
-            let Some(usage) = usage else { continue };
-
-            let key = entry
-                .get("requestId")
-                .and_then(Value::as_str)
-                .or_else(|| entry.get("message").and_then(|m| m.get("id")).and_then(Value::as_str))
-                .or_else(|| entry.get("uuid").and_then(Value::as_str));
-            if let Some(key) = key {
-                if !seen.insert(key.to_string()) {
-                    continue;
-                }
-            }
-
-            // An entry without a readable timestamp belongs to no day, so no
-            // window can count it.
-            let Some(date) = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local).date_naive())
-            else {
-                continue;
-            };
-
-            let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
-            let project_key = project_key(&cwd, root_cache);
-
-            let model = entry
-                .get("message")
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|m| !m.is_empty() && !m.starts_with('<'))
-                .unwrap_or("");
-
-            let (cache_write_5m, cache_write_1h) = extract_cache_write(usage);
-            let counters = DailyCounters {
-                input: get_u64(usage, "input_tokens"),
-                output: get_u64(usage, "output_tokens"),
-                cache_read: get_u64(usage, "cache_read_input_tokens"),
-                cache_write_5m,
-                cache_write_1h,
-                reasoning: usage
-                    .get("output_tokens_details")
-                    .map(|d| get_u64(d, "thinking_tokens"))
-                    .unwrap_or(0),
-                entries: 1,
-                model: model.to_string(),
-            };
-            daily.buckets.add(date, &project_key, &counters);
+    let parsed = cache.load(root, &files, parse_file);
+    let mut daily = ClaudeDaily { files_scanned: parsed.len() as u64, ..Default::default() };
+    for file in &parsed {
+        for ((date, cwd, _), counters) in &file.entries {
+            daily.buckets.add(*date, &project_key(cwd, root_cache), counters);
         }
     }
 
@@ -153,6 +97,85 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
         )));
     }
     Ok(daily)
+}
+
+/// Reads one session file; `None` when it cannot be opened.
+fn parse_file(file: &Path) -> Option<FileUsage> {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    let mut out = FileUsage::default();
+
+    // Dedupe is per file: the same requestId can appear in more than one
+    // session file (a resumed session, a subagent transcript), and those
+    // are separate billable events.
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        // A malformed line is skipped, never fatal to the file.
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+
+        let usage = entry
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .or_else(|| entry.get("usage"));
+        let Some(usage) = usage else { continue };
+
+        let key = entry
+            .get("requestId")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("message").and_then(|m| m.get("id")).and_then(Value::as_str))
+            .or_else(|| entry.get("uuid").and_then(Value::as_str));
+        if let Some(key) = key {
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
+        }
+
+        // An entry without a readable timestamp belongs to no day, so no
+        // window can count it.
+        let Some(date) = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local).date_naive())
+        else {
+            continue;
+        };
+
+        let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
+
+        let model = entry
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && !m.starts_with('<'))
+            .unwrap_or("");
+
+        let (cache_write_5m, cache_write_1h) = extract_cache_write(usage);
+        let counters = DailyCounters {
+            input: get_u64(usage, "input_tokens"),
+            output: get_u64(usage, "output_tokens"),
+            cache_read: get_u64(usage, "cache_read_input_tokens"),
+            cache_write_5m,
+            cache_write_1h,
+            reasoning: usage
+                .get("output_tokens_details")
+                .map(|d| get_u64(d, "thinking_tokens"))
+                .unwrap_or(0),
+            entries: 1,
+            model: model.to_string(),
+        };
+        out.entries
+            .entry((date, cwd, counters.model.clone()))
+            .or_insert_with(|| DailyCounters { model: counters.model.clone(), ..Default::default() })
+            .add(&counters);
+    }
+    Some(out)
 }
 
 /// The window report for the local dates in `[start, end)`. Each bucket is

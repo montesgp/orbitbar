@@ -15,7 +15,7 @@
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
+    cache::FileCache, find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectAliases,
     ProjectRootCache, UsageTotals, OUTSIDE_PROJECTS,
 };
 use chrono::{DateTime, Local, NaiveDate};
@@ -28,6 +28,14 @@ pub const AGENT: &str = "pi";
 
 /// The provider whose turns Claude Code's transcripts already hold.
 const CLAUDE_BRIDGE: &str = "claude-bridge";
+
+/// One session file's turns before project-root resolution and the
+/// `claude-bridge` rule: summed per `(local date, normalized raw cwd, is a
+/// claude-bridge turn, model)`, which is what `usage::cache` keeps per file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileUsage {
+    turns: BTreeMap<(NaiveDate, String, bool, String), DailyCounters>,
+}
 
 /// Everything one scan of the store counted, before any window is applied.
 #[derive(Debug, Clone, Default)]
@@ -52,19 +60,21 @@ pub fn read_usage(
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
 ) -> AgentUsageReport {
-    match read_daily(root, claude, root_cache) {
+    match read_daily(root, claude, &FileCache::default(), root_cache) {
         Ok(daily) => report(&daily, start.date_naive(), end.date_naive(), overrides, &ProjectAliases::default()),
         Err(report) => *report,
     }
 }
 
 /// Scans every session file under `root` into daily buckets, leaving out the
-/// `claude-bridge` turns whose `(date, project)` is in `claude`. `Err` carries
-/// the finished report when there is nothing to fold: the store is missing,
-/// or no session file could be read.
+/// `claude-bridge` turns whose `(date, project)` is in `claude`. Only files
+/// that changed since the last call are read again (see `usage::cache`).
+/// `Err` carries the finished report when there is nothing to fold: the
+/// store is missing, or no session file could be read.
 pub fn read_daily(
     root: &Path,
     claude: &DailyBuckets,
+    cache: &FileCache<FileUsage>,
     root_cache: &mut ProjectRootCache,
 ) -> Result<PiDaily, Box<AgentUsageReport>> {
     if !root.exists() {
@@ -75,72 +85,16 @@ pub fn read_daily(
     }
 
     let files = find_jsonl_files(root);
-    let mut daily = PiDaily::default();
-
-    for file in &files {
-        let Ok(handle) = std::fs::File::open(file) else { continue };
-        daily.files_scanned += 1;
-        let reader = BufReader::new(handle);
-        let mut seen: HashSet<String> = HashSet::new();
-        // The session header comes first; until it is read the turns have no
-        // cwd, so they are outside projects.
-        let mut project = OUTSIDE_PROJECTS.to_string();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            // A malformed line is skipped, never fatal to the file.
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-
-            match entry.get("type").and_then(Value::as_str) {
-                Some("session") => {
-                    let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
-                    project = project_key(&cwd, root_cache);
-                    continue;
-                }
-                Some("message") => {}
-                _ => continue,
-            }
-
-            let Some(message) = entry.get("message") else { continue };
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+    let parsed = cache.load(root, &files, parse_file);
+    let mut daily = PiDaily { files_scanned: parsed.len() as u64, ..Default::default() };
+    for file in &parsed {
+        for ((date, cwd, bridge, _), counters) in &file.turns {
+            let project = project_key(cwd, root_cache);
+            if *bridge && claude.contains(*date, &project) {
+                *daily.bridge_skipped.entry(*date).or_default() += counters.entries;
                 continue;
             }
-            let Some(usage) = message.get("usage").filter(|u| u.is_object()) else { continue };
-
-            if let Some(id) = entry.get("id").and_then(Value::as_str) {
-                if !seen.insert(id.to_string()) {
-                    continue;
-                }
-            }
-
-            // A turn without a readable timestamp belongs to no day.
-            let Some(date) = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local).date_naive())
-            else {
-                continue;
-            };
-
-            let provider = message.get("provider").and_then(Value::as_str).unwrap_or("");
-            if provider == CLAUDE_BRIDGE && claude.contains(date, &project) {
-                *daily.bridge_skipped.entry(date).or_default() += 1;
-                continue;
-            }
-
-            let model = message.get("model").and_then(Value::as_str).map(str::trim).unwrap_or("");
-            let counters = DailyCounters {
-                input: get_u64(usage, "input"),
-                output: get_u64(usage, "output"),
-                cache_read: get_u64(usage, "cacheRead"),
-                cache_write_5m: get_u64(usage, "cacheWrite"),
-                cache_write_1h: 0,
-                reasoning: get_u64(usage, "reasoning"),
-                entries: 1,
-                model: model.to_string(),
-            };
-            daily.buckets.add(date, &project, &counters);
+            daily.buckets.add(*date, &project, counters);
         }
     }
 
@@ -151,6 +105,73 @@ pub fn read_daily(
         )));
     }
     Ok(daily)
+}
+
+/// Reads one session file; `None` when it cannot be opened.
+fn parse_file(file: &Path) -> Option<FileUsage> {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    let mut out = FileUsage::default();
+    let mut seen: HashSet<String> = HashSet::new();
+    // The session header comes first; until it is read the turns have no
+    // cwd, so they are outside projects.
+    let mut cwd = OUTSIDE_PROJECTS.to_string();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        // A malformed line is skipped, never fatal to the file.
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+
+        match entry.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
+                continue;
+            }
+            Some("message") => {}
+            _ => continue,
+        }
+
+        let Some(message) = entry.get("message") else { continue };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(usage) = message.get("usage").filter(|u| u.is_object()) else { continue };
+
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+        }
+
+        // A turn without a readable timestamp belongs to no day.
+        let Some(date) = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local).date_naive())
+        else {
+            continue;
+        };
+
+        let bridge = message.get("provider").and_then(Value::as_str) == Some(CLAUDE_BRIDGE);
+
+        let model = message.get("model").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        let counters = DailyCounters {
+            input: get_u64(usage, "input"),
+            output: get_u64(usage, "output"),
+            cache_read: get_u64(usage, "cacheRead"),
+            cache_write_5m: get_u64(usage, "cacheWrite"),
+            cache_write_1h: 0,
+            reasoning: get_u64(usage, "reasoning"),
+            entries: 1,
+            model: model.to_string(),
+        };
+        out.turns
+            .entry((date, cwd.clone(), bridge, counters.model.clone()))
+            .or_insert_with(|| DailyCounters { model: counters.model.clone(), ..Default::default() })
+            .add(&counters);
+    }
+    Some(out)
 }
 
 /// The window report for the local dates in `[start, end)`. Each bucket is

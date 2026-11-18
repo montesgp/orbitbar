@@ -17,7 +17,7 @@
 //! projects" row, so the rows still sum to the totals.
 
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, project_display_name, project_key, AgentUsageReport, CostBasis,
+    cache::FileCache, find_jsonl_files, normalize_project_path, pricing, project_display_name, project_key, AgentUsageReport, CostBasis,
     ProjectAliases, ProjectRootCache, ProjectUsage, UsageTotals,
 };
 use chrono::{DateTime, Local};
@@ -44,6 +44,8 @@ impl Bucket {
 /// `resolve_project_root`), not the raw session cwd, so two cwds inside the
 /// same repository merge into one row. Each project is priced at its own
 /// model, then reported under its alias (see `ProjectAliases::merge_rows`).
+/// Reads every file: `collect_usage` calls [`read_usage_cached`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_usage(
     root: &Path,
     start: DateTime<Local>,
@@ -51,6 +53,42 @@ pub fn read_usage(
     overrides: &pricing::PriceOverrides,
     root_cache: &mut ProjectRootCache,
     aliases: &ProjectAliases,
+) -> AgentUsageReport {
+    read_usage_cached(root, start, end, overrides, root_cache, aliases, &FileCache::default())
+}
+
+/// One session file's last usage record, before project-root resolution and
+/// the window: what `usage::cache` keeps per file. `session` is `None` for a
+/// file with no usage record.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileUsage {
+    session: Option<Session>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Session {
+    /// The last usage record's timestamp, or the file's modified time.
+    stamp: DateTime<Local>,
+    /// Normalized raw cwd; `""` when the file names none.
+    cwd: String,
+    model: String,
+    input: u64,
+    output: u64,
+    cached: u64,
+    cache_write: u64,
+    reasoning: u64,
+}
+
+/// [`read_usage`], reading again only the files that changed since the last
+/// call with the same `cache` (see `usage::cache`).
+pub fn read_usage_cached(
+    root: &Path,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+    overrides: &pricing::PriceOverrides,
+    root_cache: &mut ProjectRootCache,
+    aliases: &ProjectAliases,
+    cache: &FileCache<FileUsage>,
 ) -> AgentUsageReport {
     if !root.exists() {
         return AgentUsageReport::not_installed(AGENT, format!("missing directory: {}", root.display()));
@@ -63,83 +101,99 @@ pub fn read_usage(
 
     let mut month = Bucket::new();
     let mut projects: std::collections::HashMap<String, Bucket> = std::collections::HashMap::new();
-    let mut files_scanned = 0u64;
+    let parsed = cache.load(root, &files, parse_file);
+    let files_scanned = parsed.len() as u64;
 
-    for file in &files {
-        let Ok(handle) = std::fs::File::open(file) else { continue };
-        files_scanned += 1;
-        let reader = BufReader::new(handle);
-
-        let mut last_usage: Option<Value> = None;
-        let mut last_ts: Option<DateTime<Local>> = None;
-        let mut file_cwd = String::new();
-        let mut file_model = String::new();
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            if !line.contains("token_usage") && !line.contains("\"cwd\"") && !line.contains("\"model\"") {
-                continue;
-            }
-            // A malformed line is skipped, never fatal to the file.
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-            let Some(payload) = entry.get("payload") else { continue };
-
-            if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
-                file_cwd = normalize_project_path(cwd);
-            }
-            if let Some(model) = payload.get("model").and_then(Value::as_str) {
-                let model = model.trim();
-                if !model.is_empty() && !model.starts_with('<') {
-                    file_model = model.to_string();
-                }
-            }
-
-            let usage = payload
-                .get("turn_token_usage")
-                .or_else(|| payload.get("info").and_then(|i| i.get("total_token_usage")))
-                .or_else(|| payload.get("usage"));
-            let Some(usage) = usage else { continue };
-
-            last_usage = Some(usage.clone());
-            last_ts = entry
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Local));
-        }
-
-        let Some(usage) = last_usage else { continue };
-
-        let stamp = match last_ts {
-            Some(ts) => ts,
-            None => {
-                let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
-                match mtime {
-                    Some(mtime) => DateTime::<Local>::from(mtime),
-                    None => continue,
-                }
-            }
-        };
-        if stamp < start || stamp >= end {
+    for file in &parsed {
+        let Some(s) = &file.session else { continue };
+        if s.stamp < start || s.stamp >= end {
             continue;
         }
-
-        let input = get_u64(&usage, "input_tokens");
-        let output = get_u64(&usage, "output_tokens");
-        let cached = get_u64(&usage, "cached_input_tokens");
-        let cache_write = get_u64(&usage, "cache_write_input_tokens");
-        let reasoning = get_u64(&usage, "reasoning_output_tokens");
-        let model = if file_model.is_empty() { None } else { Some(file_model.as_str()) };
-
-        add_entry(&mut month, input, output, cached, cache_write, reasoning, model);
-        let bucket = projects.entry(project_key(&file_cwd, root_cache)).or_insert_with(Bucket::new);
-        add_entry(bucket, input, output, cached, cache_write, reasoning, model);
+        let model = if s.model.is_empty() { None } else { Some(s.model.as_str()) };
+        add_entry(&mut month, s.input, s.output, s.cached, s.cache_write, s.reasoning, model);
+        let bucket = projects.entry(project_key(&s.cwd, root_cache)).or_insert_with(Bucket::new);
+        add_entry(bucket, s.input, s.output, s.cached, s.cache_write, s.reasoning, model);
     }
 
     if files_scanned == 0 {
         return AgentUsageReport::error(AGENT, format!("no session files readable under {}", root.display()));
     }
+    report(month, projects, files_scanned, overrides, aliases)
+}
 
+/// Reads one session file; `None` when it cannot be opened.
+fn parse_file(file: &Path) -> Option<FileUsage> {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+
+    let mut last_usage: Option<Value> = None;
+    let mut last_ts: Option<DateTime<Local>> = None;
+    let mut file_cwd = String::new();
+    let mut file_model = String::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if !line.contains("token_usage") && !line.contains("\"cwd\"") && !line.contains("\"model\"") {
+            continue;
+        }
+        // A malformed line is skipped, never fatal to the file.
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+        let Some(payload) = entry.get("payload") else { continue };
+
+        if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+            file_cwd = normalize_project_path(cwd);
+        }
+        if let Some(model) = payload.get("model").and_then(Value::as_str) {
+            let model = model.trim();
+            if !model.is_empty() && !model.starts_with('<') {
+                file_model = model.to_string();
+            }
+        }
+
+        let usage = payload
+            .get("turn_token_usage")
+            .or_else(|| payload.get("info").and_then(|i| i.get("total_token_usage")))
+            .or_else(|| payload.get("usage"));
+        let Some(usage) = usage else { continue };
+
+        last_usage = Some(usage.clone());
+        last_ts = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local));
+    }
+
+    let Some(usage) = last_usage else { return Some(FileUsage::default()) };
+    let stamp = match last_ts {
+        Some(ts) => ts,
+        None => match std::fs::metadata(file).and_then(|m| m.modified()) {
+            Ok(mtime) => DateTime::<Local>::from(mtime),
+            Err(_) => return Some(FileUsage::default()),
+        },
+    };
+    Some(FileUsage {
+        session: Some(Session {
+            stamp,
+            cwd: file_cwd,
+            model: file_model,
+            input: get_u64(&usage, "input_tokens"),
+            output: get_u64(&usage, "output_tokens"),
+            cached: get_u64(&usage, "cached_input_tokens"),
+            cache_write: get_u64(&usage, "cache_write_input_tokens"),
+            reasoning: get_u64(&usage, "reasoning_output_tokens"),
+        }),
+    })
+}
+
+/// Prices the window's totals and project rows and builds the report.
+fn report(
+    month: Bucket,
+    projects: std::collections::HashMap<String, Bucket>,
+    files_scanned: u64,
+    overrides: &pricing::PriceOverrides,
+    aliases: &ProjectAliases,
+) -> AgentUsageReport {
     let mut month_totals = month.totals;
     if month_totals.entries > 0 {
         let uncached = month_totals.input_tokens.saturating_sub(month_totals.cache_read_tokens);

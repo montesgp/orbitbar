@@ -83,6 +83,7 @@ config directory.
 | Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project aliases (`ProjectAliases`), project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir, an existing folder outside any repo, or no cwd is keyed `OUTSIDE_PROJECTS` (`""`, see `project_key`), counted in the totals and shown as the "Outside projects" row; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
 | Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key, model)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket at its own model |
+| Usage file cache | `app/src-tauri/src/usage/cache.rs` | Process-wide per-file cache of what the claude, pi and codex readers parsed, valid while a file keeps its length and modified time, so a collect reads only the files that changed |
 | Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged per `(date, project)` group with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
 | Pricing | `app/src-tauri/src/usage/pricing.rs` | Built-in price table (sourced, dated) plus `pricing.json` override loading and cost estimation |
 
@@ -133,10 +134,26 @@ config directory.
    (`config::read_project_aliases`), passes the path of
    `usage-ledger.json` in the same config directory, and runs the
    whole read off the main thread (`spawn_blocking`) so a large history
-   never stalls the window.
+   never stalls the window. The same collect runs once for `today` in a
+   background thread about 3 seconds after launch (`start_usage_warm_up`),
+   so the first panel open finds the file cache warm; its errors are only
+   logged.
 3. `usage::collect_usage` calls each reader, in the order the snapshot
    lists them — `claude::read_daily` plus `claude::report`,
-   `codex::read_usage`, `opencode::read_usage`, `pi::read_usage`. Each
+   `codex::read_usage_cached`, `opencode::read_usage`, `pi::read_daily` plus
+   `pi::report`. The claude, codex and pi session files go through the
+   process-wide file cache (`usage::cache::UsageCache::global`): per file
+   path it keeps the file's length and modified time and what the file
+   parsed to before anything machine- or config-dependent (raw cwd, local
+   date, model, the Pi `claude-bridge` flag and the counters, summed per
+   file; for codex the session's last usage record). A file whose length
+   and modified time are unchanged is not opened again, a changed one is
+   parsed again in full (dedupe stays per file), and a file that is gone
+   leaves the cache. Project-root resolution, the `claude-bridge` rule,
+   aliases and the window fold run on every call over that data, so a warm
+   collect gives the same snapshot as a cold one. The cache's lock is held
+   only for lookups and the final update, never while a file is read, and
+   a panic never poisons it; tests pass their own `UsageCache`. Each
    returns an `AgentUsageReport` with its own `AgentStatus`
    (`Ok` / `NotInstalled` / `Error`), so one broken agent store never hides
    the others. Pi is the one reader that takes another's data: its
@@ -281,6 +298,7 @@ beyond wiring the new item's `action` to the new `invoke()` call.
 | `app/src-tauri/src/usage/codex.rs` | Codex CLI JSONL reader |
 | `app/src-tauri/src/usage/opencode.rs` | OpenCode SQLite reader |
 | `app/src-tauri/src/usage/pi.rs` | Pi JSONL reader, with the `claude-bridge` check against Claude's buckets |
+| `app/src-tauri/src/usage/cache.rs` | Per-file cache of the claude, pi and codex session files |
 | `app/src-tauri/src/usage/ledger.rs` | Orbitbar's own usage ledger: load, merge, prune, atomic write |
 | `app/src-tauri/src/usage/pricing.rs` | Built-in price table, `pricing.json` override loading, cost estimation |
 | `extensions/` | Optional Herdr and OmniRoute integrations, see [extensions/README.md](../extensions/README.md) |

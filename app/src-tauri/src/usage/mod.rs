@@ -8,6 +8,7 @@
 //! missing store on one agent never hides the others: each carries its own
 //! [`AgentStatus`].
 
+pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod daily;
@@ -661,6 +662,11 @@ pub struct UsageSnapshot {
 /// Every agent's projects are reported under `aliases` (`projectAliases` in
 /// `config.json`); the ledger and the claude-bridge check use the un-aliased
 /// keys.
+///
+/// The claude, pi and codex files are read through `cache` (see
+/// `usage::cache`): only the files that changed since its last collect are
+/// read again. The app passes `UsageCache::global()`; a fresh cache reads
+/// every file, with the same result.
 pub fn collect_usage(
     window: TimeWindow,
     paths: &UsagePaths,
@@ -668,13 +674,14 @@ pub fn collect_usage(
     overrides: &pricing::PriceOverrides,
     ledger_path: Option<&Path>,
     aliases: &ProjectAliases,
+    cache: &cache::UsageCache,
 ) -> UsageSnapshot {
     let (start, end) = window_range(window, now);
     let (first_day, end_day) = (start.date_naive(), end.date_naive());
     let mut root_cache = ProjectRootCache::new();
 
-    let claude_daily = claude::read_daily(&paths.claude_dir, &mut root_cache);
-    let codex = codex::read_usage(&paths.codex_dir, start, end, overrides, &mut root_cache, aliases);
+    let claude_daily = claude::read_daily(&paths.claude_dir, &cache.claude, &mut root_cache);
+    let codex = codex::read_usage_cached(&paths.codex_dir, start, end, overrides, &mut root_cache, aliases, &cache.codex);
     let opencode = opencode::read_usage(&paths.opencode_db, start, end, &mut root_cache, aliases);
 
     // The ledger is locked from here until it is written, so the claude and
@@ -692,7 +699,7 @@ pub fn collect_usage(
         }
         Err(report) => (*report, ledger.as_ref().map(|l| l.stored(claude::AGENT)).unwrap_or_default()),
     };
-    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &mut root_cache) {
+    let mut pi = match pi::read_daily(&paths.pi_dir, &claude_buckets, &cache.pi, &mut root_cache) {
         Ok(mut daily) => {
             if let Some(ledger) = ledger.as_mut() {
                 daily.buckets = ledger.merge(pi::AGENT, &daily.buckets);
@@ -958,7 +965,7 @@ mod tests {
     fn collect_usage_reports_claude_codex_opencode_then_pi() {
         let dir = tempdir().unwrap();
         let paths = resolve_paths(Some(dir.path())).unwrap();
-        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None, &ProjectAliases::default());
+        let snapshot = collect_usage(TimeWindow::Today, &paths, Local::now(), &pricing::PriceOverrides::default(), None, &ProjectAliases::default(), &cache::UsageCache::default());
 
         let agents: Vec<&str> = snapshot.agents.iter().map(|a| a.agent.as_str()).collect();
         assert_eq!(agents, vec!["claude", "codex", "opencode", "pi"]);
@@ -1002,7 +1009,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None, &ProjectAliases::default());
+        let snapshot = collect_usage(TimeWindow::Today, &paths, now, &pricing::PriceOverrides::default(), None, &ProjectAliases::default(), &cache::UsageCache::default());
         let claude = &snapshot.agents[0];
         let pi = &snapshot.agents[3];
         assert_eq!(claude.totals.output_tokens, 10);
@@ -1062,7 +1069,7 @@ mod tests {
         }
 
         fn collect(&self, ledger: Option<&Path>) -> UsageSnapshot {
-            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger, &ProjectAliases::default())
+            collect_usage(TimeWindow::ThisMonth, &self.paths, ledger_now(), &pricing::PriceOverrides::default(), ledger, &ProjectAliases::default(), &cache::UsageCache::default())
         }
     }
 
@@ -1315,6 +1322,7 @@ mod tests {
             &pricing::PriceOverrides::default(),
             Some(&ledger),
             &ProjectAliases::new(&map),
+            &cache::UsageCache::default(),
         );
         let claude = &snapshot.agents[0];
         let rows: Vec<(&str, u64, u64)> =
@@ -1329,6 +1337,229 @@ mod tests {
         let mut expected = vec!["", wt_key.as_str(), main_key.as_str()];
         expected.sort();
         assert_eq!(keys, expected, "the ledger keeps the un-aliased keys");
+    }
+
+    /// A home with session files of all four agents over several days of
+    /// September 2026, for the file-cache tests. Output token counts are two
+    /// digits, so a test can rewrite a file at the same length.
+    struct CacheHome {
+        home: LedgerHome,
+    }
+
+    impl CacheHome {
+        fn new() -> Self {
+            let home = LedgerHome::new();
+            home.claude("a.jsonl", &[("r1", 10, 11), ("r2", 12, 12), ("r3", 14, 13)]);
+            home.claude("b.jsonl", &[("r1", 12, 21), ("r4", 15, 22)]);
+            home.pi("s.jsonl", &[("c1", 10, "openai-codex", 31), ("b1", 12, "claude-bridge", 32), ("b2", 13, "claude-bridge", 33)]);
+            std::fs::create_dir_all(&home.paths.codex_dir).unwrap();
+            let me = Self { home };
+            me.codex("one.jsonl", 11, 41);
+            me.codex("two.jsonl", 14, 42);
+            me.opencode(12, 51);
+            me
+        }
+
+        fn codex_path(&self, name: &str) -> PathBuf {
+            self.home.paths.codex_dir.join(name)
+        }
+
+        fn codex(&self, name: &str, day: u32, output: u64) {
+            let line = format!(
+                r#"{{"timestamp":"{}","payload":{{"cwd":"","model":"gpt-5.6-luna","turn_token_usage":{{"input_tokens":100,"output_tokens":{output},"cached_input_tokens":10,"cache_write_input_tokens":0,"reasoning_output_tokens":2}}}}}}"#,
+                ts(day)
+            );
+            std::fs::write(self.codex_path(name), line + "\n").unwrap();
+        }
+
+        fn opencode(&self, day: u32, output: u64) {
+            let db = &self.home.paths.opencode_db;
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, time_updated INTEGER, cost REAL,
+                     tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+                     tokens_cache_read INTEGER, tokens_cache_write INTEGER);
+                 INSERT INTO project (id, worktree) VALUES ('p1', '');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session VALUES ('s1', 'p1', ?1, 0.5, 100, ?2, 0, 0, 0)",
+                rusqlite::params![local(2026, 9, day, 12, 0).timestamp_millis(), output as i64],
+            )
+            .unwrap();
+        }
+
+        fn claude_path(&self, name: &str) -> PathBuf {
+            self.home.paths.claude_dir.join("p").join(name)
+        }
+
+        fn pi_path(&self) -> PathBuf {
+            self.home.paths.pi_dir.join("p").join("s.jsonl")
+        }
+
+        /// A ThisMonth collect through `cache`, without a ledger.
+        fn collect(&self, cache: &cache::UsageCache) -> UsageSnapshot {
+            collect_usage(
+                TimeWindow::ThisMonth,
+                &self.home.paths,
+                ledger_now(),
+                &pricing::PriceOverrides::default(),
+                None,
+                &ProjectAliases::default(),
+                cache,
+            )
+        }
+
+        /// A collect with an empty cache, as JSON.
+        fn cold(&self) -> serde_json::Value {
+            json(&self.collect(&cache::UsageCache::default()))
+        }
+    }
+
+    fn json(snapshot: &UsageSnapshot) -> serde_json::Value {
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    /// `(entries, output)` of each agent, in snapshot order.
+    fn agent_totals(snapshot: &UsageSnapshot) -> Vec<(u64, u64)> {
+        snapshot.agents.iter().map(|a| (a.totals.entries, a.totals.output_tokens)).collect()
+    }
+
+    /// Rewrites `path` with `content` and puts its modified time back, so its
+    /// length and modified time are what they were.
+    fn rewrite_keeping_length_and_mtime(path: &Path, content: &str) {
+        let before = std::fs::metadata(path).unwrap();
+        assert_eq!(before.len(), content.len() as u64, "same length");
+        std::fs::write(path, content).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), before.modified().unwrap());
+    }
+
+    fn touch_later(path: &Path) {
+        let later = std::fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(later).unwrap();
+    }
+
+    /// A collect over a warm cache gives exactly the snapshot a cold one
+    /// gives, for every agent and a window of several days, and reads no
+    /// file again.
+    #[test]
+    fn a_warm_cache_gives_the_same_snapshot_as_a_cold_one() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        let first = home.collect(&cache);
+        let parsed = (cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed());
+        assert_eq!(parsed, (2, 1, 2), "the first collect reads every file once");
+        let warm = home.collect(&cache);
+
+        assert_eq!(json(&warm), home.cold(), "warm equals cold");
+        assert_eq!(json(&first), json(&warm));
+        assert_eq!(
+            agent_totals(&warm),
+            vec![(5, 79), (2, 83), (1, 51), (2, 64)],
+            "claude 11+12+13+21+22; codex 41+42; opencode 51; pi 31 + the day-13 bridge turn"
+        );
+        assert_eq!((cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed()), parsed, "nothing read again");
+    }
+
+    /// A file whose length and modified time did not change is not read
+    /// again: rewritten in place at the same length with the old modified
+    /// time put back, its old counts still show. Once its modified time
+    /// moves, it is read again.
+    #[test]
+    fn an_unchanged_file_is_not_read_again() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        let before = home.collect(&cache);
+
+        let swap = |path: &Path, from: &str, to: &str| {
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(content.contains(from), "{content}");
+            rewrite_keeping_length_and_mtime(path, &content.replace(from, to));
+        };
+        swap(&home.claude_path("a.jsonl"), r#""output_tokens":11"#, r#""output_tokens":99"#);
+        swap(&home.pi_path(), r#""output":31"#, r#""output":99"#);
+        swap(&home.codex_path("one.jsonl"), r#""output_tokens":41"#, r#""output_tokens":99"#);
+
+        let cached = home.collect(&cache);
+        assert_eq!(json(&cached), json(&before), "the cached counts, not the new file content");
+        let cold = home.collect(&cache::UsageCache::default());
+        assert_eq!(agent_totals(&cold)[0].1, 79 - 11 + 99, "the files did change");
+
+        for path in [home.claude_path("a.jsonl"), home.pi_path(), home.codex_path("one.jsonl")] {
+            touch_later(&path);
+        }
+        let reread = home.collect(&cache);
+        assert_eq!(agent_totals(&reread), agent_totals(&cold), "a new modified time is read again");
+        assert_eq!((cache.claude.parsed(), cache.pi.parsed(), cache.codex.parsed()), (3, 2, 3));
+    }
+
+    /// An appended file is read again in full and its new entries show; its
+    /// dedupe stays per file (a repeated request id still counts once).
+    #[test]
+    fn an_appended_file_is_read_again() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        home.collect(&cache);
+
+        let path = home.claude_path("b.jsonl");
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        let first_line = content.lines().next().unwrap().to_string();
+        let appended = first_line.replace(r#""requestId":"r1""#, r#""requestId":"r9""#).replace(r#""output_tokens":21"#, r#""output_tokens":30"#);
+        content.push_str(&format!("{appended}\n{first_line}\n"));
+        std::fs::write(&path, content).unwrap();
+
+        let warm = home.collect(&cache);
+        assert_eq!(agent_totals(&warm)[0], (6, 79 + 30), "the new entry counts, the repeated r1 does not");
+        assert_eq!(json(&warm), home.cold());
+        assert_eq!(cache.claude.parsed(), 3, "only the appended file is read again");
+    }
+
+    /// A deleted file's entries leave the agent's own data and the cache.
+    #[test]
+    fn a_deleted_file_drops_out_of_the_cache() {
+        let home = CacheHome::new();
+        let cache = cache::UsageCache::default();
+        home.collect(&cache);
+        std::fs::remove_file(home.claude_path("a.jsonl")).unwrap();
+        std::fs::remove_file(home.codex_path("two.jsonl")).unwrap();
+
+        let warm = home.collect(&cache);
+        assert_eq!(agent_totals(&warm)[0], (2, 43), "only b.jsonl is left");
+        assert_eq!(agent_totals(&warm)[1], (1, 41));
+        assert_eq!(json(&warm), home.cold());
+        assert_eq!((cache.claude.len(), cache.codex.len(), cache.pi.len()), (1, 1, 1));
+    }
+
+    /// Two collects at once over one cache give the same snapshot, equal to
+    /// a cold one.
+    #[test]
+    fn concurrent_collects_over_one_cache_agree() {
+        let home = CacheHome::new();
+        let cold = home.cold();
+        for _ in 0..5 {
+            let cache = cache::UsageCache::default();
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<serde_json::Value> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let (barrier, cache, home) = (&barrier, &cache, &home);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            json(&home.collect(cache))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(results[0], cold);
+            assert_eq!(results[1], cold);
+            assert_eq!(json(&home.collect(&cache)), cold, "and the warm collect after them");
+        }
     }
 
     /// Without a ledger path the collect only reads: the parity harness
@@ -1671,7 +1902,7 @@ mod tests {
     fn parity_this_month_against_the_real_home() {
         let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
         let overrides = pricing::PriceOverrides::default();
-        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None, &ProjectAliases::default());
+        let snapshot = collect_usage(TimeWindow::ThisMonth, &paths, Local::now(), &overrides, None, &ProjectAliases::default(), &cache::UsageCache::default());
 
         println!("\n=== orbitbar Rust reader parity (ThisMonth) ===");
         for agent in &snapshot.agents {
@@ -1685,6 +1916,38 @@ mod tests {
                 agent.projects.len()
             );
             println!("          detail: {}", agent.detail);
+        }
+    }
+
+    /// Times cold and warm collects against the real home, ledger `None`,
+    /// in one process: the first ThisMonth collect reads every file, the
+    /// next ones only what changed. Debug timings; the ratio is the point.
+    /// Run with: `cargo test --lib -- --ignored timing --nocapture`
+    #[test]
+    #[ignore]
+    fn timing_cold_and_warm_collects_against_the_real_home() {
+        let paths = resolve_paths(None).expect("real home directory must resolve on this machine");
+        let overrides = pricing::PriceOverrides::default();
+        let cache = cache::UsageCache::default();
+        let run = |label: &str, window: TimeWindow, cache: &cache::UsageCache| {
+            let started = std::time::Instant::now();
+            let snapshot = collect_usage(window, &paths, Local::now(), &overrides, None, &ProjectAliases::default(), cache);
+            let totals: Vec<u64> = snapshot.agents.iter().map(|a| a.totals.output_tokens).collect();
+            println!("{label:28} {:>8.2} s  output per agent {totals:?}", started.elapsed().as_secs_f64());
+            json(&snapshot)
+        };
+        println!("
+=== orbitbar usage cache timing ===");
+        let cold_today = run("cold Today (fresh cache)", TimeWindow::Today, &cache::UsageCache::default());
+        let cold = run("cold ThisMonth", TimeWindow::ThisMonth, &cache);
+        let warm = run("warm ThisMonth", TimeWindow::ThisMonth, &cache);
+        let warm_today = run("warm Today", TimeWindow::Today, &cache);
+        // Agents may write between the runs; compare only when they did not.
+        if warm["agents"] != cold["agents"] {
+            println!("note: ThisMonth changed between the cold and warm runs (an agent is writing)");
+        }
+        if warm_today["agents"] != cold_today["agents"] {
+            println!("note: Today changed between the cold and warm runs (an agent is writing)");
         }
     }
 }
