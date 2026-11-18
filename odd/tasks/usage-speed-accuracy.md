@@ -48,10 +48,10 @@ merge project rows, and shows usage that ran outside any repository instead of d
 
 | ID | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- |
-| T1 | S3 | gentle-ai-worker: D1 (per-model buckets, ledger v2, group merge) | pending | |
-| T2 | S4 | gentle-ai-worker: D2 | pending | |
-| T3 | S2 | gentle-ai-worker: D3 | pending | |
-| T4 | S1 | gentle-ai-worker: D4 | pending | |
+| T1 | S3 | gentle-ai-worker: D1 (per-model buckets, ledger v2, group merge) | done | `ed92746` |
+| T2 | S4 | gentle-ai-worker: D2 | done | `d9a1e16` |
+| T3 | S2 | gentle-ai-worker: D3 | done | `99da098` |
+| T4 | S1 | gentle-ai-worker: D4 | done | `68c4db6` |
 | T5 | S1-S4 | gentle-ai-verify (high risk: ledger format, concurrency) | pending | |
 | T6 | all | PR to `dev`, `ci-gate`, merge | pending | |
 
@@ -68,3 +68,5 @@ merge project rows, and shows usage that ran outside any repository instead of d
   counted; Pi `gpt-6-sol` has no price row.
 - **L3** (2026-11-18, user decision): selected all four: "Carga rápida (Recomendado)", "Unir proyectos (alias)",
   "Precio por modelo", "Mostrar lo no contado".
+- **L4** (2026-11-18, T3 worker): separate bug found, not fixed here: a missing folder directly under a Windows
+  drive root gets a key like `R:name` (the separator is dropped). Follow-up.
