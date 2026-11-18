@@ -729,9 +729,9 @@ function renderUsageSection(section: AgentSectionViewModel, onToggleProjects: ()
     for (const project of section.topProjects) {
       const row = document.createElement("div");
       row.className = "usage-project-row";
-      // The full normalized path, so a disambiguated or truncated name never
-      // loses the real location.
-      row.title = project.path;
+      // The full path, so a disambiguated or truncated name never loses the
+      // real location; for "Outside projects", what the row holds.
+      row.title = project.tooltip;
 
       const name = document.createElement("span");
       name.className = "usage-project-name";

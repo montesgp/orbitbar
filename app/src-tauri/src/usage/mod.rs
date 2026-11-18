@@ -272,9 +272,19 @@ pub fn normalize_project_path(path: &str) -> String {
     }
 }
 
+/// The project key of every entry that belongs to no repository: a cwd under
+/// the OS temp dir, an existing folder outside any repository, or no cwd at
+/// all (see [`project_key`]). It counts like any project and is shown as the
+/// "Outside projects" row.
+pub const OUTSIDE_PROJECTS: &str = "";
+
 /// The display name for a project key: its last path segment, falling back
-/// to the whole key when there is no separator (e.g. a bare drive root).
+/// to the whole key when there is no separator (e.g. a bare drive root), and
+/// "Outside projects" for [`OUTSIDE_PROJECTS`].
 pub fn project_display_name(key: &str) -> String {
+    if key == OUTSIDE_PROJECTS {
+        return "Outside projects".to_string();
+    }
     key.rsplit(['\\', '/'])
         .find(|s| !s.is_empty())
         .unwrap_or(key)
@@ -338,9 +348,16 @@ impl Default for ProjectRootCache {
     }
 }
 
+/// The project key of a session `cwd`: its project root, or
+/// [`OUTSIDE_PROJECTS`] when it has none (see [`resolve_project_root`]) or
+/// is empty.
+pub fn project_key(cwd: &str, cache: &mut ProjectRootCache) -> String {
+    resolve_project_root(cwd, cache).unwrap_or_else(|| OUTSIDE_PROJECTS.to_string())
+}
+
 /// Resolves the project root for a session `cwd`, or `None` when the session
-/// does not belong to any project and must not be counted at all (neither in
-/// a project row nor in the agent totals). In order:
+/// belongs to no project ([`project_key`] then keys it [`OUTSIDE_PROJECTS`]).
+/// An empty `cwd` gives `Some("")`. In order:
 ///
 /// 1. A cwd under the OS temp dir is scratch work (for example a review
 ///    subprocess), excluded whether or not it still exists.
@@ -711,6 +728,7 @@ mod tests {
         assert_eq!(project_display_name("C:\\repos\\orbitbar"), "orbitbar");
         assert_eq!(project_display_name("/home/user/orbitbar"), "orbitbar");
         assert_eq!(project_display_name("orbitbar"), "orbitbar");
+        assert_eq!(project_display_name(OUTSIDE_PROJECTS), "Outside projects");
     }
 
     #[test]
@@ -747,7 +765,7 @@ mod tests {
         let paths = resolve_paths(Some(dir.path())).unwrap();
         let now = local(2026, 9, 15, 18, 0);
         let ts = |h: u32| local(2026, 9, 15, h, 0).to_utc().to_rfc3339();
-        // No cwd on either side: both land in the no-project bucket, so the
+        // No cwd on either side: both land in the outside-projects bucket, so the
         // test never depends on the machine's real temp or home directory.
         std::fs::create_dir_all(paths.claude_dir.join("p")).unwrap();
         std::fs::write(
@@ -787,7 +805,7 @@ mod tests {
     }
 
     /// A home for the ledger tests: claude and pi files with no cwd (the
-    /// no-project bucket, so nothing depends on the real temp or home
+    /// outside-projects bucket, so nothing depends on the real temp or home
     /// directory), and a ledger in a config folder of its own.
     struct LedgerHome {
         dir: tempfile::TempDir,
@@ -849,7 +867,7 @@ mod tests {
         local(2026, 9, day, 12, 0).to_utc().to_rfc3339()
     }
 
-    /// A ledger file holding one no-project claude record per `(date, entries, output)`.
+    /// A ledger file holding one outside-projects claude record per `(date, entries, output)`.
     fn ledger_file(records: &[(&str, u64, u64)]) -> String {
         let days: Vec<serde_json::Value> = records
             .iter()

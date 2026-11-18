@@ -8,8 +8,9 @@
 //! The ledger merge works on whole `(date, project)` groups (every model of
 //! one project on one day), so a group has its own helpers.
 //!
-//! `""` is the no-project key: an entry with no cwd counts in the agent's
-//! totals but has no project row.
+//! `""` (`OUTSIDE_PROJECTS`) is the key of entries outside any repository or
+//! with no cwd: it counts like any project and becomes the "Outside
+//! projects" row.
 
 use crate::usage::{project_display_name, CostBasis, ProjectUsage, UsageTotals};
 use chrono::NaiveDate;
@@ -167,9 +168,6 @@ impl DailyBuckets {
             for ((date, project, model), counters) in self.buckets.range(range) {
                 let amount = price(counters);
                 totals.add(counters, amount);
-                if project.is_empty() {
-                    continue;
-                }
                 let (row, models) = projects.entry(project.as_str()).or_default();
                 row.add(counters, amount);
                 if !model.is_empty() {
@@ -413,9 +411,10 @@ mod tests {
         assert_eq!(fold.totals.cost_basis, None);
     }
 
-    /// The no-project key counts in the totals and never becomes a row.
+    /// The outside-projects key counts in the totals and is a row of its own,
+    /// named "Outside projects" with an empty path.
     #[test]
-    fn fold_keeps_the_no_project_bucket_in_totals_only() {
+    fn fold_shows_the_outside_projects_bucket_as_a_row() {
         let mut buckets = DailyBuckets::default();
         buckets.add(day(1), "", &entry("priced", 5));
         buckets.add(day(1), "C:\\repos\\orbitbar", &entry("priced", 10));
@@ -425,10 +424,15 @@ mod tests {
         assert_eq!(fold.totals.entries, 2);
         assert_eq!(fold.totals.cost, Some(15.0));
         assert_eq!(fold.totals.cost_basis, Some(CostBasis::Reported));
-        assert_eq!(fold.projects.len(), 1);
-        assert_eq!(fold.projects[0].path, "C:\\repos\\orbitbar");
-        assert_eq!(fold.projects[0].name, "orbitbar");
-        assert_eq!(fold.projects[0].totals.output_tokens, 10);
+        assert_eq!(fold.projects.len(), 2);
+        assert_eq!(fold.projects[0].path, "");
+        assert_eq!(fold.projects[0].name, "Outside projects");
+        assert_eq!(fold.projects[0].model, "priced");
+        assert_eq!(fold.projects[0].totals.output_tokens, 5);
+        assert_eq!(fold.projects[0].totals.cost, Some(5.0));
+        assert_eq!(fold.projects[1].path, "C:\\repos\\orbitbar");
+        assert_eq!(fold.projects[1].name, "orbitbar");
+        assert_eq!(fold.projects[1].totals.output_tokens, 10);
     }
 
     #[test]

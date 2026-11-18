@@ -11,18 +11,19 @@
 //! `(local date, project key)` bucket (see `usage::daily`) and [`report`]
 //! folds the window's dates. The totals and the per-project breakdown come
 //! from the same buckets, so the per-project split always matches what the
-//! totals claim for the same window. Sessions outside any project (a cwd under the OS temp dir, or an existing
-//! folder that is not inside a repository; see `resolve_project_root`) are
-//! left out of the totals and the project rows alike, so that invariant holds.
+//! totals claim for the same window. Entries outside any project (a cwd under
+//! the OS temp dir, an existing folder that is not inside a repository, or no
+//! cwd; see `project_key`) count in the "Outside projects" row, so that
+//! invariant holds.
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, resolve_project_root, AgentUsageReport, CostBasis,
-    ProjectRootCache, UsageTotals,
+    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectRootCache,
+    UsageTotals,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -31,12 +32,9 @@ pub const AGENT: &str = "claude";
 /// Everything one scan of the store found, before any window is applied.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeDaily {
-    /// Every entry, by local date and resolved project root (`""`: no cwd).
+    /// Every entry, by local date and project key (see `project_key`).
     pub buckets: DailyBuckets,
     pub files_scanned: u64,
-    /// Entries whose cwd is excluded (see `resolve_project_root`), per local
-    /// date. They are in no bucket, so neither the totals nor the rows count them.
-    pub excluded: BTreeMap<NaiveDate, u64>,
 }
 
 /// Reads month/window usage from every claude session file under `root`,
@@ -119,20 +117,8 @@ pub fn read_daily(root: &Path, root_cache: &mut ProjectRootCache) -> Result<Clau
                 continue;
             };
 
-            let cwd = entry.get("cwd").and_then(Value::as_str).unwrap_or("");
-            let cwd = normalize_project_path(cwd);
-            // An entry with no cwd stays in the totals without a project row.
-            let project_key = if cwd.is_empty() {
-                cwd
-            } else {
-                match resolve_project_root(&cwd, root_cache) {
-                    Some(root) => root,
-                    None => {
-                        *daily.excluded.entry(date).or_default() += 1;
-                        continue;
-                    }
-                }
-            };
+            let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
+            let project_key = project_key(&cwd, root_cache);
 
             let model = entry
                 .get("message")
@@ -187,12 +173,7 @@ pub fn report(
             .amount
     };
     let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
-    let excluded: u64 = daily.excluded.range(start..end.max(start)).map(|(_, n)| n).sum();
-
-    let mut detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
-    if excluded > 0 {
-        detail.push_str(&format!(" - {excluded} entries outside any project not counted"));
-    }
+    let detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
     AgentUsageReport::ok(AGENT, fold.totals, fold.projects, detail)
 }
 
@@ -552,12 +533,12 @@ mod tests {
         assert_eq!(report.projects[0].model, "claude-opus-5", "the model with the most output");
     }
 
-    /// Entries whose cwd is scratch (under the temp dir) or a folder outside
-    /// any repository are not counted anywhere: not in the project rows and
-    /// not in the totals, so the split still sums to the totals. An entry with
-    /// no cwd cannot be judged and stays in the totals.
+    /// Entries whose cwd is scratch (under the temp dir), a folder outside
+    /// any repository, or missing all count in the totals and in one
+    /// "Outside projects" row with an empty path, so the rows still sum to
+    /// the totals.
     #[test]
-    fn entries_outside_any_project_are_left_out_of_totals_and_rows() {
+    fn entries_outside_any_project_count_in_the_outside_projects_row() {
         use crate::usage::RootPolicy;
         let dir = tempdir().unwrap();
         let temp = dir.path().join("Temp");
@@ -582,11 +563,16 @@ mod tests {
         let (start, end) = window();
         let report = read_usage(dir.path(), start, end, &pricing::PriceOverrides::default(), &mut cache);
 
-        assert_eq!(report.totals.entries, 2, "the kept entry and the one with no cwd");
-        assert_eq!(report.totals.output_tokens, 15);
-        assert_eq!(report.projects.len(), 1);
-        assert_eq!(report.projects[0].name, "kept-app");
-        assert_eq!(report.projects[0].totals.output_tokens, 10);
-        assert!(report.detail.contains("2 entries outside any project not counted"), "{}", report.detail);
+        assert_eq!(report.totals.entries, 4, "every entry counts");
+        assert_eq!(report.totals.output_tokens, 1215);
+        assert!(report.totals.cost.is_some());
+        let names: Vec<(&str, &str, u64)> =
+            report.projects.iter().map(|p| (p.name.as_str(), p.path.as_str(), p.totals.output_tokens)).collect();
+        assert_eq!(names[0], ("Outside projects", "", 1205), "sorted by output like any row");
+        assert_eq!(names[1].0, "kept-app");
+        assert_eq!(report.projects.len(), 2);
+        assert_eq!(report.projects.iter().map(|p| p.totals.entries).sum::<u64>(), report.totals.entries);
+        assert_eq!(report.projects.iter().map(|p| p.totals.output_tokens).sum::<u64>(), report.totals.output_tokens);
+        assert!(!report.detail.contains("not counted"), "{}", report.detail);
     }
 }

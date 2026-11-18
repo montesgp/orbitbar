@@ -301,11 +301,12 @@ project that Claude has no usage for, and its panel says how many it left
 out; turns from every other Pi provider always count.
 
 Usage is grouped by project: the repository a session ran in. Runs that are
-not part of a project are not counted, neither in the project list nor in the
-agent totals: sessions started in your operating system's temporary folder
-(for example a tool that spawns short-lived agent runs there), and sessions
-started in a folder that is not inside any Git repository (such as your home
-folder). A project whose folder was renamed or deleted still appears, as one
+not part of a project are counted in the agent totals and shown together in
+one row, **Outside projects**: sessions started in your operating system's
+temporary folder (for example a tool that spawns short-lived agent runs
+there), sessions started in a folder that is not inside any Git repository
+(such as your home folder), and sessions that recorded no folder. It is
+sorted with the other rows by output tokens. A project whose folder was renamed or deleted still appears, as one
 row named after the folder that is gone. A repository reached through two
 paths (for example through a Windows junction or a symbolic link) is one
 project, named by the path the link points to.

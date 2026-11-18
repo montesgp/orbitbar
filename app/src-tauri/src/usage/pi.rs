@@ -10,13 +10,13 @@
 //! Pi's `claude-bridge` provider runs Claude Code, so those turns are also in
 //! Claude Code's transcripts and share no id with them. A bridge turn counts
 //! only for a `(date, project)` where Claude has no bucket; every other
-//! provider always counts. Sessions outside any project (see
-//! `resolve_project_root`) are left out of the totals and the rows alike.
+//! provider always counts. Sessions outside any project or with no cwd (see
+//! `project_key`) count in the "Outside projects" row.
 
 use crate::usage::daily::{DailyBuckets, DailyCounters};
 use crate::usage::{
-    find_jsonl_files, normalize_project_path, pricing, resolve_project_root, AgentUsageReport, CostBasis,
-    ProjectRootCache, UsageTotals,
+    find_jsonl_files, normalize_project_path, pricing, project_key, AgentUsageReport, CostBasis, ProjectRootCache,
+    UsageTotals, OUTSIDE_PROJECTS,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use serde_json::Value;
@@ -32,13 +32,11 @@ const CLAUDE_BRIDGE: &str = "claude-bridge";
 /// Everything one scan of the store counted, before any window is applied.
 #[derive(Debug, Clone, Default)]
 pub struct PiDaily {
-    /// Every counted turn, by local date and resolved project root (`""`: no cwd).
+    /// Every counted turn, by local date and project key (see `project_key`).
     pub buckets: DailyBuckets,
     pub files_scanned: u64,
     /// `claude-bridge` turns left out because Claude has their `(date, project)`, per local date.
     pub bridge_skipped: BTreeMap<NaiveDate, u64>,
-    /// Turns whose cwd is excluded (see `resolve_project_root`), per local date.
-    pub excluded: BTreeMap<NaiveDate, u64>,
 }
 
 /// Reads window usage from every pi session file under `root`, pricing
@@ -85,8 +83,8 @@ pub fn read_daily(
         let reader = BufReader::new(handle);
         let mut seen: HashSet<String> = HashSet::new();
         // The session header comes first; until it is read the turns have no
-        // cwd. `None` once the cwd is excluded from every project.
-        let mut project_key: Option<String> = Some(String::new());
+        // cwd, so they are outside projects.
+        let mut project = OUTSIDE_PROJECTS.to_string();
 
         for line in reader.lines() {
             let Ok(line) = line else { continue };
@@ -96,7 +94,7 @@ pub fn read_daily(
             match entry.get("type").and_then(Value::as_str) {
                 Some("session") => {
                     let cwd = normalize_project_path(entry.get("cwd").and_then(Value::as_str).unwrap_or(""));
-                    project_key = if cwd.is_empty() { Some(cwd) } else { resolve_project_root(&cwd, root_cache) };
+                    project = project_key(&cwd, root_cache);
                     continue;
                 }
                 Some("message") => {}
@@ -125,13 +123,8 @@ pub fn read_daily(
                 continue;
             };
 
-            let Some(project) = project_key.as_deref() else {
-                *daily.excluded.entry(date).or_default() += 1;
-                continue;
-            };
-
             let provider = message.get("provider").and_then(Value::as_str).unwrap_or("");
-            if provider == CLAUDE_BRIDGE && claude.contains(date, project) {
+            if provider == CLAUDE_BRIDGE && claude.contains(date, &project) {
                 *daily.bridge_skipped.entry(date).or_default() += 1;
                 continue;
             }
@@ -147,7 +140,7 @@ pub fn read_daily(
                 entries: 1,
                 model: model.to_string(),
             };
-            daily.buckets.add(date, project, &counters);
+            daily.buckets.add(date, &project, &counters);
         }
     }
 
@@ -176,14 +169,10 @@ pub fn report(daily: &PiDaily, start: NaiveDate, end: NaiveDate, overrides: &pri
     let fold = daily.buckets.fold(start, end, price, CostBasis::ApiEquivalent);
     let in_window = |per_day: &BTreeMap<NaiveDate, u64>| -> u64 { per_day.range(start..end.max(start)).map(|(_, n)| n).sum() };
     let skipped = in_window(&daily.bridge_skipped);
-    let excluded = in_window(&daily.excluded);
 
     let mut detail = format!("{} projects - {} files", fold.projects.len(), daily.files_scanned);
     if skipped > 0 {
         detail.push_str(&format!(" - {skipped} claude-bridge turns already counted by Claude"));
-    }
-    if excluded > 0 {
-        detail.push_str(&format!(" - {excluded} entries outside any project not counted"));
     }
     AgentUsageReport::ok(AGENT, fold.totals, fold.projects, detail)
 }
@@ -262,7 +251,7 @@ mod tests {
         /// The project key the resolver gives the fixture repository `name`.
         fn key(&self, name: &str) -> String {
             let mut cache = self.cache();
-            resolve_project_root(&self.repo(name), &mut cache).expect("a repository is a project")
+            crate::usage::resolve_project_root(&self.repo(name), &mut cache).expect("a repository is a project")
         }
 
         fn session(&self, name: &str, cwd: &str, lines: &[String]) {
@@ -391,7 +380,7 @@ mod tests {
 
     /// The project comes from the session header's cwd, resolved like every
     /// other agent's: two cwds in one repository are one row, and a session
-    /// outside any repository is not counted.
+    /// outside any repository or with no cwd is in the "Outside projects" row.
     #[test]
     fn the_project_comes_from_the_session_header_cwd() {
         let fx = Fixture::new();
@@ -406,12 +395,48 @@ mod tests {
         fx.session("nocwd.jsonl", "", &[codex_turn("d", &noon(10), 5)]);
 
         let report = fx.read(&DailyBuckets::default());
-        assert_eq!(report.projects.len(), 1);
-        assert_eq!(report.projects[0].name, "repo");
-        assert_eq!(report.projects[0].path, fx.key("repo"));
-        assert_eq!(report.projects[0].totals.output_tokens, 30);
-        assert_eq!(report.totals.output_tokens, 35, "the no-cwd turn stays in the totals");
-        assert!(report.detail.contains("1 entries outside any project not counted"), "{}", report.detail);
+        assert_eq!(report.projects.len(), 2);
+        let outside = &report.projects[0];
+        assert_eq!((outside.name.as_str(), outside.path.as_str()), ("Outside projects", ""), "sorted by output");
+        assert_eq!(outside.totals.output_tokens, 705, "the plain folder and the no-cwd turn");
+        assert_eq!(report.projects[1].name, "repo");
+        assert_eq!(report.projects[1].path, fx.key("repo"));
+        assert_eq!(report.projects[1].totals.output_tokens, 30);
+        assert_eq!(report.totals.output_tokens, 735, "every turn counts");
+        assert_eq!(report.totals.entries, 4);
+        assert_eq!(report.projects.iter().map(|p| p.totals.entries).sum::<u64>(), report.totals.entries);
+        assert!(!report.detail.contains("not counted"), "{}", report.detail);
+    }
+
+    /// A session under the temp dir is outside projects too, and a
+    /// claude-bridge turn there is skipped when Claude has the same day
+    /// outside projects, like any other project key.
+    #[test]
+    fn a_temp_session_is_outside_projects_and_the_bridge_rule_applies_to_it() {
+        let fx = Fixture::new();
+        let temp = fx.dir.path().join("Temp");
+        let run = temp.join("run-1");
+        fs::create_dir_all(&run).unwrap();
+        let run = run.to_string_lossy().replace('\\', "/");
+        fx.session("t.jsonl", &run, &[codex_turn("c", &noon(10), 7), bridge_turn("b", &noon(10), 50)]);
+        let mut cache =
+            ProjectRootCache::with_policy(RootPolicy { temp_dirs: vec![temp], home: Some(fx.dir.path().to_path_buf()) });
+        let (start, end) = window();
+        let read = |claude: &DailyBuckets, cache: &mut ProjectRootCache| {
+            read_usage(&fx.sessions, claude, start, end, &pricing::PriceOverrides::default(), cache)
+        };
+
+        let alone = read(&DailyBuckets::default(), &mut cache);
+        assert_eq!(alone.totals.output_tokens, 57);
+        assert_eq!(alone.projects.len(), 1);
+        assert_eq!((alone.projects[0].name.as_str(), alone.projects[0].path.as_str()), ("Outside projects", ""));
+        assert_eq!(alone.projects[0].totals, alone.totals);
+
+        let mut claude = DailyBuckets::default();
+        claude.add(date(10), "", &DailyCounters { output: 50, entries: 1, ..Default::default() });
+        let with_claude = read(&claude, &mut cache);
+        assert_eq!(with_claude.totals.output_tokens, 7, "Claude already counts that day outside projects");
+        assert!(with_claude.detail.contains("1 claude-bridge turns already counted by Claude"), "{}", with_claude.detail);
     }
 
     #[test]

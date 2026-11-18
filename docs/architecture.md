@@ -80,7 +80,7 @@ config directory.
 | Placement | `app/src-tauri/src/placement.rs` | Pure window-placement rules: grow toward the side with room, clamp into the work area, collapse anchoring, restoring a saved position |
 | Launch actions | `app/src-tauri/src/launch.rs` | `run:<program> [args]`: parses the command line (whitespace-separated, double quotes group) and spawns the program directly, with no shell. `open:<url>` is handled in the frontend through the opener plugin, scoped to `http://` and `https://` in `capabilities/default.json` |
 | Config | `app/src-tauri/src/config.rs` | Schema (`AppConfig`), per-OS config dir resolution, load/save, the `dark` and `light` theme palettes |
-| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir or an existing folder outside any repo is excluded from rows and totals; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
+| Usage aggregation | `app/src-tauri/src/usage/mod.rs` | `TimeWindow`, `collect_usage`, project-path normalization, project-root resolution (`resolve_project_root`: nearest Git root, found on the path as the file system resolves it so a junction or symlink gives the same key as its target; a cwd under the OS temp dir, an existing folder outside any repo, or no cwd is keyed `OUTSIDE_PROJECTS` (`""`, see `project_key`), counted in the totals and shown as the "Outside projects" row; a vanished repo is keyed by its topmost missing folder), the `UsageSnapshot` shape returned to the frontend |
 | Per-agent readers | `app/src-tauri/src/usage/{claude,codex,opencode,pi}.rs` | One reader per agent store, each returning its own `AgentUsageReport` so a broken store never hides the others |
 | Daily buckets | `app/src-tauri/src/usage/daily.rs` | `(local date, project key, model)` buckets of raw counters and the fold that turns a window's dates into totals and project rows, pricing each bucket at its own model |
 | Usage ledger | `app/src-tauri/src/usage/ledger.rs` | `usage-ledger.json` next to `config.json`: the claude and pi daily buckets for 365 days, merged per `(date, project)` group with what the agents' files still hold, written through a temp file and a rename under a process-wide lock |
@@ -152,7 +152,10 @@ config directory.
    each bucket is priced at its own model and the amounts summed, so two
    models on one day each cost their own rate and a total's cost is missing
    only when no bucket in it has a price. A project row names the model with
-   the most output tokens in the window.
+   the most output tokens in the window. In every reader, usage outside any
+   repository (temp dir, a plain folder, no cwd) is keyed `""` and becomes
+   an "Outside projects" row with an empty path, so the rows always sum to
+   the totals; `usage-view.ts` gives it its own tooltip.
 5. Before folding, the claude and pi buckets are merged with the ledger
    (`usage::ledger::Session`, which holds a process-wide lock from the load
    to the write). Per `(agent, date, project)` group (every model of that

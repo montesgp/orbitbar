@@ -11,13 +11,13 @@
 //! dependency) so the widget can never write to a database a live opencode
 //! process might also have open.
 //!
-//! Sessions outside any project (a cwd under the OS temp dir, or an existing
-//! folder that is not inside a repository; see `resolve_project_root`) are
-//! left out of the totals and the project rows alike, so that invariant holds.
+//! Sessions outside any project (a worktree under the OS temp dir, an
+//! existing folder that is not inside a repository, no worktree, or no
+//! project row; see `project_key`) count in the "Outside projects" row, so
+//! the rows sum to the totals.
 
 use crate::usage::{
-    normalize_project_path, project_display_name, resolve_project_root, AgentUsageReport, CostBasis,
-    ProjectRootCache, ProjectUsage, UsageTotals,
+    normalize_project_path, project_display_name, project_key, AgentUsageReport, CostBasis, ProjectRootCache, ProjectUsage, UsageTotals,
 };
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OpenFlags};
@@ -54,25 +54,17 @@ pub fn read_usage(
     let start_ms = start.timestamp_millis();
     let end_ms = end.timestamp_millis();
 
-    let mut totals = match read_totals(&conn, start_ms, end_ms) {
+    let totals = match read_totals(&conn, start_ms, end_ms) {
         Ok(t) => t,
         Err(e) => return AgentUsageReport::error(AGENT, format!("cannot read session totals: {e}")),
     };
 
-    let (projects, excluded) = match read_projects(&conn, start_ms, end_ms, root_cache) {
+    let projects = match read_projects(&conn, start_ms, end_ms, root_cache) {
         Ok(p) => p,
         Err(e) => return AgentUsageReport::error(AGENT, format!("cannot read per-project totals: {e}")),
     };
 
-    // Sessions whose worktree is excluded (see `resolve_project_root`) are
-    // left out of the totals as well as the project rows, so the per-project
-    // split still sums to the totals.
-    subtract_excluded(&mut totals, &excluded);
-
-    let mut detail = format!("{} projects", projects.len());
-    if excluded.entries > 0 {
-        detail.push_str(&format!(" - {} sessions outside any project not counted", excluded.entries));
-    }
+    let detail = format!("{} projects", projects.len());
     AgentUsageReport::ok(AGENT, totals, projects, detail)
 }
 
@@ -106,37 +98,17 @@ fn read_totals(conn: &Connection, start_ms: i64, end_ms: i64) -> rusqlite::Resul
     })
 }
 
-/// Takes the excluded sessions' counters back out of the SQL totals. With no
-/// session left there is no cost to claim, so the cost goes back to `None`
-/// exactly as `read_totals` reports an empty window.
-fn subtract_excluded(totals: &mut UsageTotals, excluded: &UsageTotals) {
-    if excluded.entries == 0 {
-        return;
-    }
-    totals.input_tokens = totals.input_tokens.saturating_sub(excluded.input_tokens);
-    totals.output_tokens = totals.output_tokens.saturating_sub(excluded.output_tokens);
-    totals.reasoning_tokens = totals.reasoning_tokens.saturating_sub(excluded.reasoning_tokens);
-    totals.cache_read_tokens = totals.cache_read_tokens.saturating_sub(excluded.cache_read_tokens);
-    totals.cache_write_tokens = totals.cache_write_tokens.saturating_sub(excluded.cache_write_tokens);
-    totals.entries = totals.entries.saturating_sub(excluded.entries);
-    if totals.entries == 0 {
-        totals.cost = None;
-        totals.cost_basis = None;
-    } else {
-        totals.cost = Some((totals.cost.unwrap_or(0.0) - excluded.cost.unwrap_or(0.0)).max(0.0));
-    }
-}
-
-/// The per-project rows, plus the totals of the sessions whose worktree was
-/// excluded (zero entries when none was).
+/// The per-project rows. Every session in the window is in exactly one row,
+/// so they sum to `read_totals`: a session with no project row or an empty
+/// worktree is outside projects.
 fn read_projects(
     conn: &Connection,
     start_ms: i64,
     end_ms: i64,
     root_cache: &mut ProjectRootCache,
-) -> rusqlite::Result<(Vec<ProjectUsage>, UsageTotals)> {
+) -> rusqlite::Result<Vec<ProjectUsage>> {
     let mut stmt = conn.prepare(
-        "SELECT p.worktree,
+        "SELECT COALESCE(p.worktree, ''),
                 COALESCE(SUM(s.tokens_input), 0),
                 COALESCE(SUM(s.tokens_output), 0),
                 COALESCE(SUM(s.tokens_reasoning), 0),
@@ -144,7 +116,7 @@ fn read_projects(
                 COALESCE(SUM(s.tokens_cache_write), 0),
                 COALESCE(SUM(s.cost), 0.0),
                 COUNT(*)
-         FROM session s JOIN project p ON s.project_id = p.id
+         FROM session s LEFT JOIN project p ON s.project_id = p.id
          WHERE s.time_updated >= ?1 AND s.time_updated < ?2
          GROUP BY p.worktree",
     )?;
@@ -171,17 +143,9 @@ fn read_projects(
     // another checkout of the same repo), so this aggregates by resolved
     // root rather than pushing one row per SQL group.
     let mut aggregated: HashMap<String, UsageTotals> = HashMap::new();
-    let mut excluded = UsageTotals::default();
     for row in rows {
         let (worktree, totals) = row?;
-        let key = normalize_project_path(&worktree);
-        if key.is_empty() {
-            continue;
-        }
-        let acc = match resolve_project_root(&key, root_cache) {
-            Some(root) => aggregated.entry(root).or_default(),
-            None => &mut excluded,
-        };
+        let acc = aggregated.entry(project_key(&normalize_project_path(&worktree), root_cache)).or_default();
         acc.input_tokens += totals.input_tokens;
         acc.output_tokens += totals.output_tokens;
         acc.reasoning_tokens += totals.reasoning_tokens;
@@ -204,7 +168,7 @@ fn read_projects(
             totals,
         });
     }
-    Ok((out, excluded))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -390,10 +354,10 @@ mod tests {
     }
 
     /// Sessions whose worktree is scratch (under the temp dir) or a folder
-    /// outside any repository are not counted anywhere: not in the project
-    /// rows and not in the totals, so the split still sums to the totals.
+    /// outside any repository stay in the totals and form one "Outside
+    /// projects" row with an empty path, so the rows still sum to the totals.
     #[test]
-    fn sessions_outside_any_project_are_left_out_of_totals_and_rows() {
+    fn sessions_outside_any_project_count_in_the_outside_projects_row() {
         use crate::usage::RootPolicy;
         let dir = tempdir().unwrap();
         let temp = dir.path().join("Temp");
@@ -429,18 +393,50 @@ mod tests {
         let (start, end) = window();
         let report = read_usage(&path, start, end, &mut cache);
 
-        assert_eq!(report.totals.entries, 1);
-        assert_eq!(report.totals.output_tokens, 10);
-        assert_eq!(report.totals.cost, Some(1.0));
-        assert_eq!(report.projects.len(), 1);
-        assert_eq!(report.projects[0].name, "kept-app");
-        assert!(report.detail.contains("2 sessions outside any project not counted"), "{}", report.detail);
+        assert_eq!(report.totals.entries, 3);
+        assert_eq!(report.totals.output_tokens, 1210);
+        assert_eq!(report.totals.cost, Some(51.0));
+        assert_eq!(report.projects.len(), 2);
+        let outside = &report.projects[0];
+        assert_eq!((outside.name.as_str(), outside.path.as_str()), ("Outside projects", ""), "sorted by output");
+        assert_eq!(outside.totals.output_tokens, 1200);
+        assert_eq!(outside.totals.cost, Some(50.0));
+        assert_eq!(outside.totals.cost_basis, Some(CostBasis::Reported));
+        assert_eq!(report.projects[1].name, "kept-app");
+        assert_eq!(report.projects.iter().map(|p| p.totals.entries).sum::<u64>(), report.totals.entries);
+        assert!(!report.detail.contains("not counted"), "{}", report.detail);
     }
 
-    /// When every session is excluded there is nothing left to bill: the cost
-    /// goes back to "no value", not a leftover 0.0.
+    /// A session with an empty worktree, or whose project row is missing,
+    /// is outside projects too: the rows always sum to the totals.
     #[test]
-    fn when_everything_is_excluded_the_totals_are_empty_with_no_cost() {
+    fn sessions_with_no_worktree_are_outside_projects() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = make_db(&path);
+        conn.execute("INSERT INTO project (id, worktree) VALUES ('p1', '')", []).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+             VALUES ('s1', 'p1', ?1, 1.0, 100, 10, 0, 0, 0),
+                    ('s2', 'gone', ?1, 2.0, 100, 20, 0, 0, 0)",
+            [ms(2026, 9, 15)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (start, end) = window();
+        let report = read_usage(&path, start, end, &mut ProjectRootCache::new());
+        assert_eq!(report.totals.entries, 2);
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].path, "");
+        assert_eq!(report.projects[0].name, "Outside projects");
+        assert_eq!(report.projects[0].totals, report.totals);
+    }
+
+    /// When every session is outside projects they are all in the totals and
+    /// the one row, with their reported cost.
+    #[test]
+    fn when_every_session_is_outside_projects_they_are_all_in_one_row() {
         use crate::usage::RootPolicy;
         let dir = tempdir().unwrap();
         let temp = dir.path().join("Temp");
@@ -466,9 +462,11 @@ mod tests {
         let (start, end) = window();
         let report = read_usage(&path, start, end, &mut cache);
 
-        assert_eq!(report.totals.entries, 0);
-        assert_eq!(report.totals.cost, None);
-        assert_eq!(report.totals.cost_basis, None);
-        assert!(report.projects.is_empty());
+        assert_eq!(report.totals.entries, 1);
+        assert_eq!(report.totals.cost, Some(2.5));
+        assert_eq!(report.totals.cost_basis, Some(CostBasis::Reported));
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].name, "Outside projects");
+        assert_eq!(report.projects[0].totals, report.totals);
     }
 }
