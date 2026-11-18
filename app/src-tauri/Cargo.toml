@@ -33,7 +33,7 @@ chrono = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # A second launch must hand over to the running bar, not open another one.
-# The updater installs signed releases from GitHub (see `updater` in lib.rs).
+# The updater installs signed releases from GitHub (see `start_update_checks` in lib.rs).
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"

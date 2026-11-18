@@ -363,10 +363,16 @@ fn start_update_checks(app: tauri::AppHandle) {
 /// be fetched or verified is logged and the next tick tries again.
 #[cfg(desktop)]
 fn update_tick(app: &tauri::AppHandle) {
-    let auto_update = match config::load(app) {
-        Ok(cfg) => cfg.auto_update,
+    // Read-only: `config::load` would rename and reset a config that does not
+    // parse, and this thread must never do that behind the user's back.
+    let auto_update = match config::config_dir(app).map(|dir| config::read_auto_update(&dir.join("config.json"))) {
+        Ok(Some(on)) => on,
+        Ok(None) => {
+            eprintln!("orbitbar: update check skipped, config.json could not be read");
+            return;
+        }
         Err(e) => {
-            eprintln!("orbitbar: update check skipped, config could not be read: {e}");
+            eprintln!("orbitbar: update check skipped, config folder unknown: {e}");
             return;
         }
     };
@@ -580,5 +586,28 @@ mod tests {
     fn collapsed_tab_radii_never_overflow() {
         let r = SIZE_COLLAPSED.0 / 2;
         assert!(css_keeps_radii(r, r, SIZE_COLLAPSED.0, SIZE_COLLAPSED.1));
+    }
+}
+#[cfg(test)]
+mod updater_config_tests {
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    /// Installs trust only the project's key, over HTTPS, from this
+    /// repository's releases. A changed key or endpoint must be deliberate.
+    #[test]
+    fn the_updater_trusts_only_the_project_key_over_https() {
+        let v: serde_json::Value = serde_json::from_str(CONF).unwrap();
+        let u = &v["plugins"]["updater"];
+        assert_eq!(
+            u["pubkey"],
+            "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFRTQwM0YxRkVDN0REODcKUldTSDNjZis4UVBrVG1DcHZ4ZzVDK202VlVjSHQ1WXY5NnExdUlsdm9iOThuczJxRnEvTWI4NWgK"
+        );
+        assert_eq!(
+            u["endpoints"],
+            serde_json::json!(["https://github.com/montesgp/orbitbar/releases/latest/download/latest.json"])
+        );
+        assert_eq!(u["windows"]["installMode"], "passive");
+        assert!(u.get("dangerousInsecureTransportProtocol").is_none());
+        assert_eq!(v["bundle"]["createUpdaterArtifacts"], true);
     }
 }

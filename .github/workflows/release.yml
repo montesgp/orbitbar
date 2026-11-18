@@ -153,8 +153,8 @@ jobs:
       # The build jobs run in parallel and each merges its own entry into the
       # release's latest.json, so two jobs finishing together can drop one.
       # A platform missing there would never receive updates: the release
-      # stays a draft instead, and re-running the failed build job adds the
-      # entry back.
+      # stays a draft instead, and re-running that platform's build job adds
+      # the entry back (and re-runs this check).
       - name: Check that latest.json lists every platform
         uses: actions/github-script@v7
         env:
@@ -182,12 +182,16 @@ jobs:
               asset_id: asset.id,
               headers: { accept: 'application/octet-stream' },
             });
-            const manifest = JSON.parse(Buffer.from(data).toString('utf8'));
+            // Octokit may hand back an ArrayBuffer, a string or parsed JSON,
+            // depending on the content type GitHub serves the asset with.
+            const manifest = typeof data === 'string' ? JSON.parse(data)
+              : data instanceof ArrayBuffer ? JSON.parse(Buffer.from(data).toString('utf8'))
+              : data;
             const platforms = Object.keys(manifest.platforms ?? {});
             const missing = expected.filter((p) => !platforms.includes(p));
             core.info(`latest.json ${manifest.version}: ${platforms.join(', ')}`);
             if (missing.length > 0) {
-              core.setFailed(`latest.json is missing ${missing.join(', ')}; re-run the matching build job.`);
+              core.setFailed(`latest.json is missing ${missing.join(', ')}. The builds succeeded but raced on the file: re-run the build job of each missing platform, which also re-runs this check.`);
             }
 
       - name: Publish the draft release

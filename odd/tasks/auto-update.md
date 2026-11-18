@@ -46,8 +46,8 @@ everything on `dev` ships as 0.3.0.
 | ID | Specs | Route | Status | Commit |
 | --- | --- | --- | --- | --- |
 | T1 | S4 | inline: key pair in `~/.tauri/orbitbar-updater.key{,.password,.pub}`, two repo secrets | done | (outside the repo) |
-| T2 | S1, S2, S4 | gentle-ai-worker: D1-D6 | pending | |
-| T3 | S1-S4 | gentle-ai-verify (high risk: release, security) | pending | |
+| T2 | S1, S2, S4 | gentle-ai-worker: D1-D6 | done | `706a25c`, `868eb76`, `018536d` |
+| T3 | S1-S4 | gentle-ai-verify (high risk: release, security); findings fixed inline | done | see L4 |
 | T4 | S3 | inline: bump 0.3.0, PR to `dev`, promotion PR to `main`, tag `v0.3.0` | pending | |
 | T5 | S3, S4 | inline: check the release has `latest.json` and signatures; local end-to-end update test | pending | |
 
@@ -64,3 +64,9 @@ everything on `dev` ships as 0.3.0.
 - **L3** (2026-11-17, T1): key pair generated with a random password; the key and password files are readable
   only by the user; secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` created (no
   secret existed before).
+- **L4** (2026-11-18, verify): no blockers; S1, S2, S4, D1-D4, D6 PASS; D5 wiring PASS. Platform keys confirmed in
+  the tauri-action v1 source (`upload-version-json.ts`: a universal macOS build writes `darwin-aarch64` and
+  `darwin-x86_64`). Fixed: the update tick read the config through `config::load`, which renames and resets an
+  invalid file, so it now uses the read-only `config::read_auto_update` (RED: function missing; GREEN 215 passed);
+  the workflow check parses an ArrayBuffer, a string or JSON; clearer re-run message; stale doc references; a test
+  pins the pubkey, endpoint, passive install mode and `createUpdaterArtifacts`.

@@ -28,7 +28,7 @@ pub struct AppConfig {
     /// true rather than failing to parse.
     pub auto_start: bool,
     /// Whether Orbitbar checks GitHub Releases for a signed update and installs
-    /// it (see `updater` in lib.rs). On by default, including for a config
+    /// it (see `start_update_checks` in lib.rs). On by default, including for a config
     /// written before this field existed; read again on every check, so the
     /// menu toggle takes effect without a restart.
     pub auto_update: bool,
@@ -246,6 +246,19 @@ pub fn save(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
 /// callers outside this module (the `get_usage` command, to find
 /// `pricing.json` next to `config.json`) can reuse the exact same directory
 /// resolution instead of re-deriving it.
+/// `autoUpdate` from the config at `path`, for the background update check.
+/// Read-only, unlike `load`: it never creates, repairs or renames the file,
+/// because a thread the user never triggered must not reset a config they are
+/// editing. A missing file or field is the default (on); a file that cannot
+/// be read or parsed is `None`, which skips that check.
+pub fn read_auto_update(path: &std::path::Path) -> Option<bool> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<AppConfig>(&raw).ok().map(|cfg| cfg.auto_update),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(AppConfig::default().auto_update),
+        Err(_) => None,
+    }
+}
+
 pub fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let resolver = app.path();
     let dir = resolver
@@ -507,6 +520,30 @@ mod tests {
     /// Automatic updates are on by default, and a config written before
     /// `autoUpdate` existed gets true too, so an upgraded install keeps
     /// receiving updates without the user opting in.
+    /// The background update check reads `autoUpdate` without ever writing
+    /// the file: a config the user is mid-way through editing must not be
+    /// renamed to `.invalid` and reset by a thread they never triggered.
+    #[test]
+    fn the_update_check_reads_auto_update_without_writing_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        assert_eq!(read_auto_update(&path), Some(true), "missing file: the default");
+        assert!(!path.exists(), "a missing file is not created");
+
+        std::fs::write(&path, r#"{ "autoUpdate": false }"#).unwrap();
+        assert_eq!(read_auto_update(&path), Some(false));
+
+        std::fs::write(&path, r#"{ "theme": "light" }"#).unwrap();
+        assert_eq!(read_auto_update(&path), Some(true), "field missing: the default");
+
+        let broken = r#"{ "autoUpdate": false, "theme": "#;
+        std::fs::write(&path, broken).unwrap();
+        assert_eq!(read_auto_update(&path), None, "invalid JSON: skip the check");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "left byte-for-byte");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no .invalid copy, no new file");
+    }
+
     #[test]
     fn auto_update_is_on_by_default_and_for_a_config_without_the_field() {
         assert!(AppConfig::default().auto_update);
