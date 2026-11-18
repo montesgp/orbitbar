@@ -27,6 +27,11 @@ pub struct AppConfig {
     /// serde default, a config written before this field existed simply gets
     /// true rather than failing to parse.
     pub auto_start: bool,
+    /// Whether Orbitbar checks GitHub Releases for a signed update and installs
+    /// it (see `updater` in lib.rs). On by default, including for a config
+    /// written before this field existed; read again on every check, so the
+    /// menu toggle takes effect without a restart.
+    pub auto_update: bool,
     /// Whether items flagged `example` are shown. Off by default: examples
     /// only demonstrate what a cell can do, they are not part of the user's bar.
     pub show_examples: bool,
@@ -56,6 +61,7 @@ impl Default for AppConfig {
             theme: "dark".into(),
             font_size: 10.0,
             auto_start: true,
+            auto_update: true,
             show_examples: false,
             position: None,
             items: default_items(),
@@ -496,6 +502,28 @@ mod tests {
     fn an_explicit_auto_start_false_is_preserved() {
         let cfg: AppConfig = serde_json::from_str(r#"{"autoStart":false}"#).unwrap();
         assert!(!cfg.auto_start);
+    }
+
+    /// Automatic updates are on by default, and a config written before
+    /// `autoUpdate` existed gets true too, so an upgraded install keeps
+    /// receiving updates without the user opting in.
+    #[test]
+    fn auto_update_is_on_by_default_and_for_a_config_without_the_field() {
+        assert!(AppConfig::default().auto_update);
+        let cfg: AppConfig = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(cfg.auto_update, "an older config must opt in to updates, not out of them");
+    }
+
+    /// The menu toggle writes `autoUpdate`; an explicit false must survive a
+    /// save and a reload, under the camelCase key the frontend sends.
+    #[test]
+    fn an_explicit_auto_update_false_round_trips() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"autoUpdate":false}"#).unwrap();
+        assert!(!cfg.auto_update);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""autoUpdate":false"#), "{json}");
+        let again: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!again.auto_update);
     }
 
     /// The usage panel always opens on Today and the selector is never
